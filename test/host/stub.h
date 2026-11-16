@@ -7,8 +7,13 @@
 #include "buffers.h"
 #include "errormsg.h"
 
-/* in-memory image access */
-void     image_load(const char *filename);
-void     image_save(const char *filename);
+/* image access (write-through via the fatops image layer) */
+void image_load(const char *filename);
+void image_flush(void);
+
+/* FatFs shim: base directory of the emulated FAT medium, an empty
+   string passes host paths through unchanged */
+void fatshim_set_base(const char *dir);
+void fatshim_clear_base(void);
 
 #endif

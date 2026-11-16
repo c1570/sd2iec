@@ -37,7 +37,6 @@ class D64:
             if len(self.data) == size + errinfo:
                 self.data = self.data[:size]
         self.d81 = d81 or len(self.data) == 819200
-        self.fn = fn
 
     def read_sector(self, track, sector):
         o = 256 * lba(track, sector, self.d81)
@@ -197,7 +196,7 @@ def alloc_sector(img):
                 img[o + 4*t+1 + (s >> 3)] &= ~(1 << (s & 7))
                 img[o + 4*t] -= 1
                 return t, s
-    raise Exception("disk full")
+    raise RuntimeError("disk full")
 
 def create_rel(img, name, reclen, records, insert_at=(18, 1, 0)):
     """Create a REL file per CBM DOS layout. Returns list of used sectors."""

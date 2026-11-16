@@ -20,7 +20,9 @@ C1541 = os.environ.get("C1541", "c1541")
 OUT = (os.path.abspath(sys.argv[1]) if len(sys.argv) > 1
        else os.path.join(os.path.dirname(os.path.abspath(__file__)), "testdata"))
 
-IMAGES = ("blank.d64", "multi.d64", "blank.d81", "blank.d71", "c1541.d64")
+# files written by generate(), removed again on failure
+IMAGES = ("blank.d64", "multi.d64", "blank.d81", "blank.d71", "c1541.d64",
+          "data.bin")
 
 # c1541 takes the record length as a single character after ",l,"
 C1541_RECLEN = 50
@@ -49,7 +51,8 @@ def generate():
     d64lib.check_allocated(img, used)
     with open(os.path.join(OUT, "multi.d64"), "wb") as f:
         f.write(img)
-    print("multi.d64 written (40 records, record length 17)")
+    print("multi.d64 written (40 records of length 17, the last data "
+          "sector holds four more empty ones)")
 
     # 3. blank D81 for the super side sector tests
     c1541(["-format", "d81test,00", "d81", os.path.join(OUT, "blank.d81")])
@@ -85,7 +88,7 @@ def main():
     os.makedirs(OUT, exist_ok=True)
     try:
         generate()
-    except (RuntimeError, AssertionError, OSError) as e:
+    except (RuntimeError, AssertionError, OSError, ValueError) as e:
         # leave no partial set behind, make would treat it as up to date
         for name in IMAGES:
             try:

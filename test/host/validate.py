@@ -52,8 +52,8 @@ def c1541_validate_unchanged(image, tmp, label):
 def main():
     datadir = sys.argv[1] if len(sys.argv) > 1 else "testdata"
 
-    # the harness writes its working image into the current directory
-    d = d64lib.D64("work.d64")
+    # the harness writes its working image into the data directory
+    d = d64lib.D64(os.path.join(datadir, "work.d64"))
 
     # --- T1: record length 20, records 1-4 ----------------------------
     reclen, records, data_ts, ss_blocks = d.read_rel("T1")
@@ -85,7 +85,7 @@ def main():
 
 
     # --- T3: five 200-byte records spanning sectors --------------------
-    reclen, records, data_ts, ss_blocks = d.read_rel("T3")
+    reclen, records, _, _ = d.read_rel("T3")
     check(reclen == 200, "T3 record length %d" % reclen)
     for i in (0, 2, 3, 4):  # record 2 was modified at offset 179
         expect = bytes(testbyte(j, i * 30 + 1) for j in range(200))
@@ -98,7 +98,7 @@ def main():
     check(r2[189:200] == bytes(11), "T3 record 2 tail not zero-filled")
 
     # --- T5: 300 records of 7 bytes ------------------------------------
-    reclen, records, data_ts, ss_blocks = d.read_rel("T5")
+    reclen, records, _, _ = d.read_rel("T5")
     check(reclen == 7, "T5 record length %d" % reclen)
     check(len(records) >= 300, "T5 has %d records" % len(records))
     for i in range(min(300, len(records))):
@@ -112,13 +112,13 @@ def main():
     check(d.find("T2") is None, "T2 still present after scratch")
 
     # --- T4: three full-sector records ----------------------------------
-    reclen, records, data_ts, ss_blocks = d.read_rel("T4")
+    reclen, records, _, _ = d.read_rel("T4")
     check(reclen == 254, "T4 record length %d" % reclen)
     for i in range(3):
         expect = bytes(testbyte(j, 10 * i + 2) for j in range(254))
         check(records[i] == expect, "T4 record %d mismatch" % (i + 1))
 
-    # --- every REL file on the image is allocated in the BAM -----------
+    # --- the REL files this script checks are allocated in the BAM -----
     for name in ("T1", "T3", "T4", "T5", "M1"):
         if d.find(name) is not None:
             _, _, data_ts, ss_blocks = d.read_rel(name)
@@ -132,9 +132,8 @@ def main():
 
     # --- multi.d64 (created by genimages.py) ----------------------------
     d = d64lib.D64(os.path.join(datadir, "multi.d64"))
-    reclen, records, data_ts, ss_blocks = d.read_rel("MULTIREL",
-                                                     expect_reclen=17,
-                                                     expect_records=40)
+    reclen, records, _, _ = d.read_rel("MULTIREL", expect_reclen=17,
+                                       expect_records=40)
     for r in range(40):
         expect = bytes((r * 11 + i * 3) & 0xFF if (r + i) % 5 else 0
                        for i in range(17))
@@ -159,7 +158,7 @@ def main():
             if os.path.exists(outname):
                 os.remove(outname)
 
-    image = "work.d64"
+    image = os.path.join(datadir, "work.d64")
     # M1: c1541 delivers full untrimmed records: 129 fresh records
     # (0xff followed by zeros) and the written record 130. Writing the
     # last record does not grow the file, so there is no extra record.
@@ -175,20 +174,24 @@ def main():
                              "D64")
 
     # G1 on the D81 image: the harness writes work.d81 into the
-    # current directory. c1541 delivers full untrimmed 4-byte records,
+    # data directory. c1541 delivers full untrimmed 4-byte records,
     # fresh ones as ff 00 00 00.
-    image81 = "work.d81"
+    image81 = os.path.join(datadir, "work.d81")
     check(os.path.exists(image81), "work.d81 is missing")
     if os.path.exists(image81):
+        # 45720 empty records, record 45721 written, then the empty
+        # records of the partially used last data sector
         fresh4 = b"\xff\x00\x00\x00"
-        expected = fresh4 * 45719
-        expected += bytes(testbyte(i, 88) for i in range(4))
+        prefix = fresh4 * 45720
+        prefix += bytes(testbyte(i, 88) for i in range(4))
         got, err = rel_read_bytes(image81, "G1")
         check(err is None, "G1: %s" % err)
         if got is not None:
-            check(got == expected,
-                  "G1: %d bytes differ from expected %d bytes"
-                  % (len(got), len(expected)))
+            check(got.startswith(prefix),
+                  "G1: first %d bytes differ from expected" % len(prefix))
+            tail = got[len(prefix):]
+            check(len(tail) % 4 == 0 and tail == fresh4 * (len(tail) // 4),
+                  "G1: %d trailing bytes are not empty records" % len(tail))
 
         # c1541 -validate must not find anything to fix
         c1541_validate_unchanged(image81,
@@ -197,7 +200,7 @@ def main():
 
     # D71 cross-check: read D2 (720 records of 254 bytes) and verify
     # that -validate leaves the image untouched
-    image71 = "work.d71"
+    image71 = os.path.join(datadir, "work.d71")
     check(os.path.exists(image71), "work.d71 is missing")
     if os.path.exists(image71):
         fresh = b"\xff" + b"\x00" * 253

@@ -7,6 +7,7 @@
 #define CONFIG_MAX_PARTITIONS      2
 #define CONFIG_ERROR_BUFFER_SIZE   100
 #define CONFIG_COMMAND_BUFFER_SIZE 120
+#define MAX_DRIVES                 8
 
 /* the harness tests the disk image REL implementation */
 #define CONFIG_D64_REL

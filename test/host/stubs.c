@@ -13,85 +13,45 @@
 #include "buffers.h"
 #include "dirent.h"
 #include "errormsg.h"
+#include "flags.h"
 #include "ff.h"
 #include "wrapops.h"
 #include "d64ops.h"
 #include "parser.h"
 #include "stub.h"
 
-/* ---------------- in-memory disk image ---------------- */
+/* ---------------- image access ---------------- */
+/* Images are real host files accessed through the FatFs shim, the
+   same way fatops.c accesses them on the firmware. Writes go straight
+   to the file. */
 
-static uint8_t  *image_data;
-static uint32_t  image_size;
+static uint8_t image_open;
 
 void image_load(const char *filename) {
-  FILE *f = fopen(filename, "rb");
+  if (image_open)
+    f_close(&partition[0].imagehandle);
+  image_open = 0;
 
-  if (!f) {
-    perror(filename);
+  /* host paths are used as given */
+  fatshim_set_base("");
+  if (f_open(&partition[0].fatfs, &partition[0].imagehandle,
+             (const UCHAR *)filename, FA_READ | FA_WRITE)) {
+    fprintf(stderr, "cannot open image %s\n", filename);
     exit(1);
   }
-  fseek(f, 0, SEEK_END);
-  image_size = ftell(f);
-  fseek(f, 0, SEEK_SET);
-  free(image_data);
-  image_data = malloc(image_size);
-  if (fread(image_data, 1, image_size, f) != image_size) {
-    perror(filename);
-    exit(1);
-  }
-  fclose(f);
-
-  /* d64_mount() reads the image size from the FatFs file handle and
-     d64_open_rel() checks the write flag */
-  partition[0].imagehandle.fsize = image_size;
-  partition[0].imagehandle.flag  = FA_READ | FA_WRITE;
+  image_open = 1;
 }
 
-void image_save(const char *filename) {
-  FILE *f = fopen(filename, "wb");
-  if (!f) {
-    perror(filename);
+void image_flush(void) {
+  if (image_open && f_sync(&partition[0].imagehandle) != FR_OK) {
+    fprintf(stderr, "image flush failed\n");
     exit(1);
   }
-  fwrite(image_data, 1, image_size, f);
-  fclose(f);
 }
 
 /* ---------------- image layer ---------------- */
 
-uint8_t image_read(uint8_t part, uint32_t offset, void *buffer, uint16_t length) {
-  (void)part;
-  if (offset + length > image_size)
-    return 2;
-  memcpy(buffer, image_data + offset, length);
-  return 0;
-}
-
-uint8_t image_write(uint8_t part, uint32_t offset, const void *buffer,
-                    uint16_t length, uint8_t flush) {
-  (void)part;
-  (void)flush;
-  if (!(partition[0].imagehandle.flag & FA_WRITE))
-    return 2;
-  if (offset + length > image_size)
-    return 2;
-  memcpy(image_data + offset, buffer, length);
-  return 0;
-}
-
-/* The harness only works on the root directory of a mounted image */
-uint8_t image_chdir(path_t *path, cbmdirent_t *dent, buffer_t *buf) {
-  (void)dent;
-  (void)buf;
-  path->dir.dxx.track  = 18;
-  path->dir.dxx.sector = 1;
-  return 0;
-}
-
-void image_unmount(uint8_t part) {
-  (void)part;
-}
+/* image_read/image_write/image_chdir/image_unmount come from fatops.c */
 
 /* ---------------- error channel ---------------- */
 
@@ -116,12 +76,27 @@ volatile uint8_t led_state;
 void update_leds(void) {
 }
 
-/* ---------------- partition table ---------------- */
+/* ---------------- global flags ---------------- */
 
-partition_t partition[CONFIG_MAX_PARTITIONS];
-uint8_t     max_part = CONFIG_MAX_PARTITIONS;
+uint8_t globalflags;
 
-/* ---------------- error channel buffer ---------------- */
+/* set_changelist stub (normally diskchange.c): the harness has no swap
+   lists, fatops.c only calls it with an empty file name */
+void set_changelist(path_t *path, uint8_t *filename) {
+  (void)path;
+  (void)filename;
+  globalflags &= (uint8_t)~AUTOSWAP_ACTIVE;
+}
+
+/* ---------------- command channel buffer ---------------- */
+/* normally defined in doscmd.c, which the harness does not compile */
+uint8_t command_buffer[CONFIG_COMMAND_BUFFER_SIZE+2];
+uint8_t command_length;
+
+/* date matching globals (normally in doscmd.c), the harness never
+   matches on dates */
+date_t date_match_start;
+date_t date_match_end;
 
 /* Simplified error channel: set_ok_message just resets the error state */
 uint8_t set_ok_message(buffer_t *buf) {

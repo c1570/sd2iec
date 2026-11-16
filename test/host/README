@@ -1,34 +1,66 @@
-Host-side tests for the D64 REL file support
-=============================================
+Host-side tests for the REL file support
+========================================
 
-This directory contains a small test harness that compiles the firmware
-source (src/d64ops.c) for the host by shadowing the AVR-specific headers
-with the shims in shims/ and linking it against stubs.c, which emulates
-the image access layer with an in-memory copy of a D64 file. harness.c
-includes d64ops.c directly to reach its internal functions and emulates
-the bus protocol of iec.c (refill on EOI and buffer wrap for REL files).
+This directory contains a small test harness that compiles firmware
+sources for the host by shadowing the AVR-specific headers with the
+shims in shims/. stubs.c supplies the remaining firmware environment
+(error channel, command buffer and image loading), and the disk images
+are ordinary host files.
+
+The harness covers both REL back-ends:
+
+  - D64 (src/d64ops.c), which harness.c includes directly to reach its
+    internal functions.
+  - FAT (src/fatops.c and the rest of the file layer), driven through
+    the full file_open() path. fatshim.c provides the FatFs API on top
+    of libc so the unmodified fatops.c runs on the host.
+
+harness.c emulates the bus protocol of iec.c (refill on EOI and on
+buffer wrap for REL files). The FAT tests fill the command buffer and
+call file_open(), which runs the same filename and record length parsing
+the command channel uses.
 
 Running the tests
 -----------------
 
-    make check      generates test images (blank.d64 and multi.d64 via
-                    d64lib.py, blank.d71, blank.d81 and c1541.d64 via the
-                    c1541 tool from VICE, looked up on PATH; set
-                    C1541=... to use a different binary) and runs the
-                    CRUD tests against them
-    make validate   verifies the resulting disk images independently
-                    with the Python code in d64lib.py/validate.py
+    make check      generates the test images (blank.d64 and multi.d64
+                    via d64lib.py, blank.d71, blank.d81 and c1541.d64 via
+                    the c1541 tool from VICE, looked up on PATH; set
+                    C1541=... to use a different binary), then
+                    runs the tests twice (plain and with ASan/UBSan) and
+                    verifies the resulting images with validate.py
+    make validate   alias for check
     make clean      removes build products and test images
 
-The CRUD tests cover creating REL files, reading and writing records
+Working images and the FAT root live under the directory given to the
+harness (testdata/ by default, also the default of validate.py) and are
+recreated as needed.
+
+Coverage
+--------
+
+The D64 tests cover creating REL files, reading and writing records
 (including records that span sector boundaries and record length 254),
 seeking with the P command, growth past the end of the file, appending,
-reopening (including the record length mismatch error), scratching,
-files without data sectors (opening, record length mismatch, growth and
-scratch) and reading a file created by c1541 itself. validate.py checks
-the on-disk side sector and data sector chains, BAM allocation and
-directory entry contents, and cross-checks selected files with c1541.
+reopening (including the record length mismatch error), scratch on a
+multi-sector directory, linked buffers, read-only images, files without
+data sectors (opening, record length mismatch, growth and scratch) and
+reading a file created by c1541 itself.
 
-Note that these tests exercise the logic of the REL implementation, but
-they do not replace a firmware build: compile for real hardware with
-"make CONFIG=..." before flashing.
+The D81 test grows a file across a super side sector group boundary, the
+D71 tests cover the six side sector limit and the last record at it.
+
+The FAT tests drive the same read, write, seek and growth paths through
+file_open() with the FatFs shim, plus the storage layouts: extension
+based R00 files with the P00-style header (record length at offset 25)
+and the raw layout with a single record length byte. Where FAT behaves
+differently from the D64 path, the so marked QUIRK tests assert the
+current behaviour.
+
+validate.py checks the on-disk side sector and data sector chains, BAM
+allocation and directory entry contents, and cross-checks selected
+files with c1541.
+
+Note that these tests exercise the REL implementation logic; they do not
+replace a firmware build. Compile for real hardware with "make CONFIG=..."
+before flashing.

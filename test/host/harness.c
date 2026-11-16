@@ -1,5 +1,6 @@
 /* harness.c: host-side REL tests for the D64/D81/D71 image code in
-   d64ops.c (compiled by including d64ops.c to access its internals).
+   d64ops.c (compiled by including d64ops.c to access its internals) and
+   for the FAT path via the separately compiled file layer.
 
    The bus protocol is emulated the same way iec.c drives the buffers:
    writes land in buf->data at buf->position, the refill callback runs
@@ -20,9 +21,13 @@
 #include "errormsg.h"
 #include "wrapops.h"
 #include "d64ops.h"
+#include "doscmd.h"
+#include "fatops.h"
 #include "stub.h"
 
-/* Access the internals of the code under test */
+/* Access the internals of the code under test; the FAT file layer
+   (fatops.c, fileops.c, parser.c, utils.c, buffers.c) is compiled
+   separately */
 #include "d64ops.c"
 
 /* ------------------------------------------------------------------ */
@@ -35,6 +40,11 @@ static int failures;
 /* Abort a loop once the current test has failed, without being
    affected by failures of earlier tests */
 #define TEST_FAILED(start) (failures != (start))
+
+/* directory with the test images and the FAT root, from argv[1] */
+static char data_dir[512];
+/* working copy of the D64 image shared by the D64 tests */
+static char work_path[512];
 
 #define CHECK(cond, ...) do {                                         \
     checks_run++;                                                     \
@@ -67,10 +77,8 @@ static int bus_write(buffer_t *buf, const uint8_t *data, int len) {
     uint8_t eoi = (i == len - 1);
 
     if (buf->mustflush) {
-      if (buf->refill(buf)) {
-        printf("    [refill@%d err %d]\n", i, current_error);
+      if (buf->refill(buf))
         return -1;
-      }
     }
 
     buf->data[buf->position] = data[i];
@@ -84,10 +92,8 @@ static int bus_write(buffer_t *buf, const uint8_t *data, int len) {
 
     if (buf->recordlen && eoi) {
       buf->mustflush = 0;
-      if (buf->refill(buf)) {
-        printf("    [eoi-refill err %d]\n", current_error);
+      if (buf->refill(buf))
         return -1;
-      }
     }
   }
   return 0;
@@ -146,8 +152,15 @@ static void mount(const char *filename) {
   path_t path;
 
   /* release everything from the previous image */
-  free_multiple_buffers(FMB_ALL_CLEAN);
   d64_unmount(0);
+  free_multiple_buffers(FMB_ALL_CLEAN);
+  /* d64_unmount leaves the static BAM buffer pointers set; reset them
+     so the next d64_mount allocates fresh slots instead of reusing
+     slots that free_multiple_buffers just released to file buffers */
+  bam_buffer = NULL;
+  bam_buffer2 = NULL;
+  bam_refcount = 0;
+  max_part = 1;
 
   memset(&partition[0], 0, sizeof(partition[0]));
   image_load(filename);
@@ -157,6 +170,23 @@ static void mount(const char *filename) {
     printf("mount of %s failed\n", filename);
     exit(1);
   }
+}
+
+static void copy_file(const char *src, const char *dst);
+
+/* Copy the blank image to a named working image and return its path */
+static void fresh_image(char *path, size_t size, const char *name) {
+  char blank[512];
+
+  snprintf(path,  size,  "%s/%s", data_dir, name);
+  snprintf(blank, sizeof(blank), "%s/blank.d64", data_dir);
+  copy_file(blank, path);
+}
+
+/* Mount a generated image read-only so that the tests leave it intact */
+static void mount_fixture(const char *filename) {
+  mount(filename);
+  partition[0].imagehandle.flag &= (uint8_t)~FA_WRITE;
 }
 
 /* Compare a directory name with an ASCII name, ignoring the bit that
@@ -169,31 +199,58 @@ static uint8_t ucasequal(const uint8_t *a, const char *b) {
   return 1;
 }
 
+/* Point path at the root directory of the mounted image */
+static void root_path(path_t *path) {
+  memset(path, 0, sizeof(*path));
+  path->part = 0;
+  dir_ts(&path->dir.dxx.track, &path->dir.dxx.sector);
+}
+
+/* Look up a REL file in the root directory. Sets up path and dent for
+   d64_open_rel/d64_delete, returns 1 if found */
+static int find_rel(path_t *path, cbmdirent_t *dent, const char *name) {
+  dh_t dh;
+
+  root_path(path);
+  if (d64_opendir(&dh, path) != 0)
+    return 0;
+  while (d64_readdir(&dh, dent) == 0) {
+    if ((dent->typeflags & TYPE_MASK) == TYPE_REL &&
+        ucasequal(dent->name, name))
+      return 1;
+  }
+  return 0;
+}
+
+/* Count the REL files in the root directory */
+static int count_rel(void) {
+  path_t path;
+  cbmdirent_t dent;
+  dh_t dh;
+  int count = 0;
+
+  root_path(&path);
+  if (d64_opendir(&dh, &path) == 0) {
+    while (d64_readdir(&dh, &dent) == 0) {
+      if ((dent.typeflags & TYPE_MASK) == TYPE_REL)
+        count++;
+    }
+  }
+  return count;
+}
+
 /* Open a REL file, emulating the relevant parts of file_open */
 static buffer_t *rel_open(const char *name, uint8_t recordlen, uint8_t create) {
   path_t path;
   cbmdirent_t dent;
-  dh_t dh;
   buffer_t *buf;
-  int found = 0;
+  int found;
 
   buf = alloc_buffer();
   if (!buf)
     return NULL;
 
-  memset(&path, 0, sizeof(path));
-  path.part = 0;
-  dir_ts(&path.dir.dxx.track, &path.dir.dxx.sector);
-
-  if (d64_opendir(&dh, &path) == 0) {
-    while (d64_readdir(&dh, &dent) == 0) {
-      if ((dent.typeflags & TYPE_MASK) == TYPE_REL &&
-          ucasequal(dent.name, name)) {
-        found = 1;
-        break;
-      }
-    }
-  }
+  found = find_rel(&path, &dent, name);
 
   if (!found && !create) {
     set_error(ERROR_FILE_NOT_FOUND);
@@ -201,9 +258,7 @@ static buffer_t *rel_open(const char *name, uint8_t recordlen, uint8_t create) {
     return NULL;
   }
 
-  if (found) {
-    /* d64_readdir already points at the entry */
-  } else {
+  if (!found) {
     memset(&dent, 0, sizeof(dent));
     ustrncpy(dent.name, (uint8_t *)name, CBM_NAME_LENGTH);
   }
@@ -222,27 +277,59 @@ static void rel_close(buffer_t *buf) {
   buf->cleanup(buf);
 }
 
-/* Look up a REL file in the root directory. Sets up path and dent for
-   d64_open_rel/d64_delete, returns 1 if found */
-static int find_rel(path_t *path, cbmdirent_t *dent, const char *name) {
-  dh_t dh;
-
-  memset(path, 0, sizeof(*path));
-  path->part = 0;
-  dir_ts(&path->dir.dxx.track, &path->dir.dxx.sector);
-  if (d64_opendir(&dh, path) != 0)
-    return 0;
-  while (d64_readdir(&dh, dent) == 0) {
-    if ((dent->typeflags & TYPE_MASK) == TYPE_REL &&
-        ucasequal(dent->name, name))
-      return 1;
-  }
-  return 0;
+/* Write the BAM back and flush the image file */
+static void commit_image(void) {
+  d64_bam_commit();
+  image_flush();
 }
 
-static void unmount_and_save(const char *filename) {
-  d64_bam_commit();
-  image_save(filename);
+/* ------------------------------------------------------------------ */
+/*  FAT-specific helpers                                              */
+/* ------------------------------------------------------------------ */
+
+static char fatroot_base[512];
+
+static void fat_mount(void) {
+  free_multiple_buffers(FMB_ALL_CLEAN);
+  /* the BAM buffers belonged to the last D64 image and were just
+     released, d64ops must not see them again */
+  bam_buffer   = NULL;
+  bam_buffer2  = NULL;
+  bam_refcount = 0;
+  snprintf(fatroot_base, sizeof(fatroot_base), "%s/fatroot", data_dir);
+  fatshim_set_base(fatroot_base);
+  memset(&partition[0], 0, sizeof(partition[0]));
+  partition[0].fop = &fatops;
+  f_mount(0, &partition[0].fatfs);
+  current_part = 0;
+  max_part = 1;
+  set_error(ERROR_OK);
+}
+
+/* Start a test from an empty FAT root. */
+static void fat_reset(void) {
+  fat_mount();
+  fatshim_clear_base();
+  file_extension_mode = 0;
+}
+
+/* Set up the command channel buffer and run file_open for a REL file.
+   The record length is the raw byte after the second comma, like on a
+   real drive. Returns the opened buffer or NULL. */
+static buffer_t *fat_open(const char *name, uint8_t recordlen,
+                          uint8_t secondary) {
+  snprintf((char *)command_buffer, CONFIG_COMMAND_BUFFER_SIZE + 2, "%s", name);
+  {
+    uint8_t len = strlen(name);
+    command_buffer[len] = recordlen;
+    command_length = len + 1;
+  }
+  file_open(secondary);
+  return find_buffer(secondary);
+}
+
+static void fat_close(buffer_t *buf) {
+  cleanup_and_free_buffer(buf);
 }
 
 /* Fill a buffer with test data. Zero bytes are replaced because the
@@ -265,7 +352,7 @@ static void t_create_and_write(void) {
   int n;
 
   printf("t_create_and_write\n");
-  mount("work.d64");
+  mount(work_path);
 
   /* create */
   buf = rel_open("T1", RECLEN, 1);
@@ -335,7 +422,7 @@ static void t_create_and_write(void) {
   CHECK_ERR(ERROR_RECORD_MISSING);
 
   rel_close(buf);
-  unmount_and_save("work.d64");
+  commit_image();
 }
 
 static void t_partial_and_seek(void) {
@@ -344,7 +431,7 @@ static void t_partial_and_seek(void) {
   int n;
 
   printf("t_partial_and_seek\n");
-  mount("work.d64");
+  mount(work_path);
 
   buf = rel_open("T1", RECLEN, 0);
   if (!buf) {
@@ -397,7 +484,7 @@ static void t_partial_and_seek(void) {
   CHECK(n == RECLEN && memcmp(back, data, RECLEN) == 0, "record 3 damaged");
 
   rel_close(buf);
-  unmount_and_save("work.d64");
+  commit_image();
 }
 
 static void t_seek_past_eof(void) {
@@ -406,7 +493,7 @@ static void t_seek_past_eof(void) {
   int n;
 
   printf("t_seek_past_eof\n");
-  mount("work.d64");
+  mount(work_path);
 
   buf = rel_open("T2", RECLEN, 1);
   if (!buf) {
@@ -453,7 +540,7 @@ static void t_seek_past_eof(void) {
   CHECK(n == 1 && back[0] == 0xff, "record 1 not fresh after growth");
 
   rel_close(buf);
-  unmount_and_save("work.d64");
+  commit_image();
 }
 
 static void t_spanning_records(void) {
@@ -463,7 +550,7 @@ static void t_spanning_records(void) {
   int n, i;
 
   printf("t_spanning_records\n");
-  mount("work.d64");
+  mount(work_path);
 
   /* 200-byte records cross sector boundaries (2*200 > 254) */
   buf = rel_open("T3", L, 1);
@@ -478,7 +565,7 @@ static void t_spanning_records(void) {
   }
   CHECK_ERR(ERROR_OK);
 
-  /* read them back in random order */
+  /* read them back in reverse order */
   for (i = 4; i >= 0; i--) {
     rel_position(buf, i + 1, 1);
     CHECK_ERR(ERROR_OK);
@@ -502,7 +589,7 @@ static void t_spanning_records(void) {
   CHECK(memcmp(back + 179, patch, 10) == 0, "cross-sector write misplaced");
 
   rel_close(buf);
-  unmount_and_save("work.d64");
+  commit_image();
 }
 
 static void t_full_sector_records(void) {
@@ -512,7 +599,7 @@ static void t_full_sector_records(void) {
   int n, i;
 
   printf("t_full_sector_records\n");
-  mount("work.d64");
+  mount(work_path);
 
   /* record length 254: every record fills a complete sector payload */
   buf = rel_open("T4", L, 1);
@@ -537,7 +624,7 @@ static void t_full_sector_records(void) {
   }
 
   rel_close(buf);
-  unmount_and_save("work.d64");
+  commit_image();
 }
 
 static void t_many_records(void) {
@@ -545,11 +632,10 @@ static void t_many_records(void) {
   uint8_t data[254], back[300];
   buffer_t *buf;
   int n, i;
-
   int start = failures;
 
   printf("t_many_records\n");
-  mount("work.d64");
+  mount(work_path);
 
   /* write 300 records sequentially: requires growth across 9 sectors */
   buf = rel_open("T5", L, 1);
@@ -582,7 +668,7 @@ static void t_many_records(void) {
   }
 
   rel_close(buf);
-  unmount_and_save("work.d64");
+  commit_image();
 }
 
 static void t_reopen_persistence(void) {
@@ -591,7 +677,7 @@ static void t_reopen_persistence(void) {
   int n;
 
   printf("t_reopen_persistence\n");
-  mount("work.d64");
+  mount(work_path);
 
   /* T1 was written by the earlier tests */
   buf = rel_open("T1", RECLEN, 0);
@@ -639,18 +725,17 @@ static void t_reopen_persistence(void) {
   CHECK(memcmp(back, data, RECLEN) == 0, "appended record mismatch");
   rel_close(buf);
 
-  unmount_and_save("work.d64");
+  commit_image();
 }
 
 static void t_delete(void) {
   buffer_t *buf;
   path_t path;
   cbmdirent_t dent;
-  dh_t dh;
-  int found = 0;
+  int found;
 
   printf("t_delete\n");
-  mount("work.d64");
+  mount(work_path);
 
   buf = rel_open("T2", RECLEN, 0);
   if (!buf) {
@@ -660,25 +745,15 @@ static void t_delete(void) {
   rel_close(buf);
 
   /* scratch it */
-  memset(&path, 0, sizeof(path));
-  path.part = 0;
-  dir_ts(&path.dir.dxx.track, &path.dir.dxx.sector);
-
-  if (d64_opendir(&dh, &path) == 0) {
-    while (d64_readdir(&dh, &dent) == 0) {
-      if (!ustrcmp(dent.name, (uint8_t *)"T2")) {
-        found = 1;
-        break;
-      }
-    }
-  }
+  found = find_rel(&path, &dent, "T2");
   CHECK(found, "T2 not found in directory");
-  CHECK(d64_delete(&path, &dent) == 1, "delete failed");
+  if (found)
+    CHECK(d64_delete(&path, &dent) == 1, "delete failed");
 
   CHECK(rel_open("T2", RECLEN, 0) == NULL, "deleted file still opens");
   CHECK_ERR(ERROR_FILE_NOT_FOUND);
 
-  unmount_and_save("work.d64");
+  commit_image();
 }
 
 
@@ -687,11 +762,10 @@ static void t_seq_after_short(void) {
   uint8_t data[254], back[300];
   buffer_t *buf;
   int n, i;
-
   int start = failures;
 
   printf("t_seq_after_short\n");
-  mount("work.d64");
+  mount(work_path);
 
   /* L=100 records span sector boundaries; records 1, 2 and 4 are long,
      record 3 is a short write in the middle of the file */
@@ -742,7 +816,7 @@ static void t_seq_after_short(void) {
   CHECK_ERR(ERROR_RECORD_MISSING);
 
   rel_close(buf);
-  unmount_and_save("work.d64");
+  commit_image();
 }
 
 static void t_seq_from_open(void) {
@@ -750,11 +824,10 @@ static void t_seq_from_open(void) {
   uint8_t data[254], back[300];
   buffer_t *buf;
   int n, i, j;
-
   int start = failures;
 
   printf("t_seq_from_open\n");
-  mount("work.d64");
+  mount(work_path);
 
   /* records ending exactly at a sector boundary must be terminated
      with EOI when read sequentially right after opening */
@@ -773,8 +846,8 @@ static void t_seq_from_open(void) {
     }
 
     rel_close(buf);
-    unmount_and_save("work.d64");
-    mount("work.d64");
+    commit_image();
+    mount(work_path);
     buf = rel_open((j == 0) ? "S2" : "S3", L, 0);
     if (!buf) {
       CHECK(0, "reopen failed (error %d)", current_error);
@@ -793,7 +866,7 @@ static void t_seq_from_open(void) {
     rel_close(buf);
   }
 
-  unmount_and_save("work.d64");
+  commit_image();
 }
 
 static void t_multiss(void) {
@@ -803,7 +876,7 @@ static void t_multiss(void) {
   int n;
 
   printf("t_multiss\n");
-  mount("work.d64");
+  mount(work_path);
 
   /* 130 records of 254 bytes = 130 data sectors: two side sector
      blocks, the second one is member 1 of the first group */
@@ -820,8 +893,8 @@ static void t_multiss(void) {
   /* the seek error stays until the next error, like on a 1541 */
   CHECK_ERR(ERROR_RECORD_MISSING);
   rel_close(buf);
-  unmount_and_save("work.d64");
-  mount("work.d64");
+  commit_image();
+  mount(work_path);
   buf = rel_open("M1", L, 0);
   if (!buf) {
     CHECK(0, "reopen failed (error %d)", current_error);
@@ -843,48 +916,49 @@ static void t_multiss(void) {
   CHECK(n == 1 && back[0] == 0xff, "record 1 not fresh after growth");
 
   rel_close(buf);
-  unmount_and_save("work.d64");
+  commit_image();
 }
 
-static void t_d81_groups(void) {
+static void t_d81_groups(const char *img) {
   const uint8_t L = 4;
   uint8_t data[254], back[300];
   buffer_t *buf;
   int n;
 
   printf("t_d81_groups\n");
-  mount("blank.d81");
+  mount(img);
 
-  /* 45720 records of 4 bytes = 182880 bytes = 720 data sectors, the
-     written record adds one more sector and starts a second side
-     sector group registered in the super side sector */
+  /* 45720 records of 4 bytes fill 720 data sectors, the first six
+     side sector blocks. Writing record 45721 needs a 721st data
+     sector, whose side sector block is the first of a second group
+     registered in the super side sector */
   buf = rel_open("G1", L, 1);
   if (!buf) {
     CHECK(0, "create failed (error %d)", current_error);
     return;
   }
 
-  rel_position(buf, 45720, 1);
+  rel_position(buf, 45721, 1);
   CHECK_ERR(ERROR_RECORD_MISSING);
   fill_data(data, L, 88);
-  CHECK(bus_write(buf, data, L) == 0, "write at 45720 failed");
+  CHECK(bus_write(buf, data, L) == 0, "write at 45721 failed");
   rel_close(buf);
-  unmount_and_save("work.d81");
+  commit_image();
 
-  mount("work.d81");
+  mount(img);
   buf = rel_open("G1", L, 0);
   if (!buf) {
     CHECK(0, "reopen failed (error %d)", current_error);
     return;
   }
-  CHECK(buf->pvt.d64.record_max >= 45720, "record_max %d", buf->pvt.d64.record_max);
+  CHECK(buf->pvt.d64.record_max >= 45721, "record_max %d", buf->pvt.d64.record_max);
 
-  rel_position(buf, 45720, 1);
+  rel_position(buf, 45721, 1);
   CHECK_ERR(ERROR_OK);
   n = bus_read_record(buf, back, sizeof(back));
-  CHECK(n == L, "record 45720 delivered %d bytes", n);
+  CHECK(n == L, "record 45721 delivered %d bytes", n);
   fill_data(data, L, 88);
-  CHECK(memcmp(back, data, L) == 0, "record 45720 mismatch");
+  CHECK(memcmp(back, data, L) == 0, "record 45721 mismatch");
 
   rel_position(buf, 1, 1);
   CHECK_ERR(ERROR_OK);
@@ -892,7 +966,7 @@ static void t_d81_groups(void) {
   CHECK(n == 1 && back[0] == 0xff, "record 1 not fresh after growth");
 
   rel_close(buf);
-  unmount_and_save("work.d81");
+  commit_image();
 }
 
 static void t_freeblocks(void) {
@@ -901,7 +975,7 @@ static void t_freeblocks(void) {
   uint16_t base, after;
 
   printf("t_freeblocks\n");
-  mount("work.d64");
+  mount(work_path);
 
   base = d64_freeblocks(0);
 
@@ -924,41 +998,29 @@ static void t_freeblocks(void) {
   {
     path_t path;
     cbmdirent_t dent;
-    dh_t dh;
-    int found = 0;
+    int found = find_rel(&path, &dent, "F1");
 
-    memset(&path, 0, sizeof(path));
-    path.part = 0;
-    dir_ts(&path.dir.dxx.track, &path.dir.dxx.sector);
-
-    if (d64_opendir(&dh, &path) == 0) {
-      while (d64_readdir(&dh, &dent) == 0) {
-        if ((dent.typeflags & TYPE_MASK) == TYPE_REL &&
-            ucasequal(dent.name, "F1")) {
-          found = 1;
-          break;
-        }
-      }
-    }
     CHECK(found, "F1 not found");
-    CHECK(d64_delete(&path, &dent) == 1, "delete failed");
+    if (found)
+      CHECK(d64_delete(&path, &dent) == 1, "delete failed");
   }
 
   after = d64_freeblocks(0);
   CHECK(after == base, "scratch leaked blocks (base %u after %u)", base, after);
 
-  unmount_and_save("work.d64");
+  commit_image();
 }
 
 static void t_multirel_open(void) {
   uint8_t back[300];
   buffer_t *buf;
   int n, r, i;
-
+  char path[512];
   int start = failures;
 
   printf("t_multirel_open\n");
-  mount("multi.d64");
+  snprintf(path, sizeof(path), "%s/multi.d64", data_dir);
+  mount_fixture(path);
 
   buf = rel_open("MULTIREL", 17, 0);
   if (!buf) {
@@ -1003,7 +1065,7 @@ static void t_append_after_eof(void) {
   int n;
 
   printf("t_append_after_eof\n");
-  mount("work.d64");
+  mount(work_path);
 
   buf = rel_open("A1", 20, 1);
   if (!buf) {
@@ -1029,9 +1091,9 @@ static void t_append_after_eof(void) {
   fill_data(data, 20, 90);
   CHECK(bus_write(buf, data, 20) == 0, "append failed");
   rel_close(buf);
-  unmount_and_save("work.d64");
+  commit_image();
 
-  mount("work.d64");
+  mount(work_path);
   buf = rel_open("A1", 20, 0);
   if (!buf) {
     CHECK(0, "reopen failed (error %d)", current_error);
@@ -1047,7 +1109,7 @@ static void t_append_after_eof(void) {
   CHECK(memcmp(back, data, 20) == 0, "record 13 mismatch");
   rel_close(buf);
 
-  unmount_and_save("work.d64");
+  commit_image();
 }
 
 static void t_read_after_write(void) {
@@ -1056,7 +1118,7 @@ static void t_read_after_write(void) {
   int n;
 
   printf("t_read_after_write\n");
-  mount("work.d64");
+  mount(work_path);
 
   buf = rel_open("A2", 20, 1);
   if (!buf) {
@@ -1080,7 +1142,7 @@ static void t_read_after_write(void) {
   CHECK(memcmp(back, data, 5) == 0, "written record mismatch");
 
   rel_close(buf);
-  unmount_and_save("work.d64");
+  commit_image();
 }
 
 
@@ -1089,26 +1151,18 @@ static void t_scratch_dir(void) {
   buffer_t *buf;
   path_t path;
   cbmdirent_t dent;
-  dh_t dh;
   uint8_t tt, ss;
+  uint8_t link_before[2], link_after[2];
   int count, before, found, i;
   char name[3];
+  char scratch[512];
 
   printf("t_scratch_dir\n");
-  mount("work.d64");
-
-  memset(&path, 0, sizeof(path));
-  path.part = 0;
-  dir_ts(&path.dir.dxx.track, &path.dir.dxx.sector);
+  fresh_image(scratch, sizeof(scratch), "scratch.d64");
+  mount(scratch);
 
   /* create ten REL files so the directory spans two sectors */
-  before = 0;
-  if (d64_opendir(&dh, &path) == 0) {
-    while (d64_readdir(&dh, &dent) == 0) {
-      if ((dent.typeflags & TYPE_MASK) == TYPE_REL)
-        before++;
-    }
-  }
+  before = count_rel();
   fill_data(data, 20, 1);
   for (i = 0; i < 10; i++) {
     name[0] = 'F';
@@ -1122,46 +1176,29 @@ static void t_scratch_dir(void) {
     CHECK(bus_write(buf, data, 20) == 0, "write %s failed", name);
     rel_close(buf);
   }
-  unmount_and_save("work.d64");
-  mount("work.d64");
+  commit_image();
+  mount(scratch);
 
-  /* scratch the first file, its entry sits in the first directory
-     sector while F8/F9 are in the second one */
-  memset(&path, 0, sizeof(path));
-  path.part = 0;
-  dir_ts(&path.dir.dxx.track, &path.dir.dxx.sector);
+  /* scratch the first file: F0..F7 sit in the first directory sector,
+     F8/F9 in the second one. Its link to the next sector must survive. */
+  dir_ts(&tt, &ss);
+  CHECK(checked_read(0, tt, ss, link_before, 2, ERROR_ILLEGAL_TS_LINK) == 0,
+        "directory read failed");
+  CHECK(link_before[0] == tt && link_before[1] != 0,
+        "directory not extended: link %d/%d", link_before[0], link_before[1]);
 
-  found = 0;
-  if (d64_opendir(&dh, &path) == 0) {
-    while (d64_readdir(&dh, &dent) == 0) {
-      if ((dent.typeflags & TYPE_MASK) == TYPE_REL &&
-          ucasequal(dent.name, "F0")) {
-        found = 1;
-        break;
-      }
-    }
-  }
+  found = find_rel(&path, &dent, "F0");
   CHECK(found, "F0 not found");
   if (found)
     CHECK(d64_delete(&path, &dent) == 1, "delete F0 failed");
 
-  /* the first directory sector still links to the second one */
-  dir_ts(&tt, &ss);
-  {
-    uint8_t link[2];
-    CHECK(checked_read(0, tt, ss, link, 2, ERROR_ILLEGAL_TS_LINK) == 0,
-          "directory read failed");
-    CHECK(link[0] == tt, "directory link broken: %d/%d", link[0], link[1]);
-  }
+  CHECK(checked_read(0, tt, ss, link_after, 2, ERROR_ILLEGAL_TS_LINK) == 0,
+        "directory read failed");
+  CHECK(link_after[0] == link_before[0] && link_after[1] == link_before[1],
+        "directory link changed to %d/%d", link_after[0], link_after[1]);
 
   /* count the remaining REL entries */
-  count = 0;
-  if (d64_opendir(&dh, &path) == 0) {
-    while (d64_readdir(&dh, &dent) == 0) {
-      if ((dent.typeflags & TYPE_MASK) == TYPE_REL)
-        count++;
-    }
-  }
+  count = count_rel();
   CHECK(count == before + 9, "directory holds %d REL entries, expected %d",
         count, before + 9);
 
@@ -1176,7 +1213,7 @@ static void t_scratch_dir(void) {
       rel_close(buf);
   }
 
-  unmount_and_save("work.d64");
+  commit_image();
 }
 
 static void t_eoi_at_sector_end(void) {
@@ -1186,7 +1223,7 @@ static void t_eoi_at_sector_end(void) {
   int n;
 
   printf("t_eoi_at_sector_end\n");
-  mount("work.d64");
+  mount(work_path);
 
   /* record 3 starts at file offset 200, a 54-byte write ends exactly
      on the last byte of the sector; the following write must start a
@@ -1204,8 +1241,8 @@ static void t_eoi_at_sector_end(void) {
   fill_data(data, 3, 99);
   CHECK(bus_write(buf, data, 3) == 0, "next write failed");
   rel_close(buf);
-  unmount_and_save("work.d64");
-  mount("work.d64");
+  commit_image();
+  mount(work_path);
   buf = rel_open("E1", L, 0);
   if (!buf) {
     CHECK(0, "reopen failed (error %d)", current_error);
@@ -1227,7 +1264,7 @@ static void t_eoi_at_sector_end(void) {
   CHECK(memcmp(back, data, 3) == 0, "record 4 mismatch");
 
   rel_close(buf);
-  unmount_and_save("work.d64");
+  commit_image();
 }
 
 static void t_spurious_record(void) {
@@ -1235,11 +1272,10 @@ static void t_spurious_record(void) {
   uint8_t data[254], back[300];
   buffer_t *buf;
   int n, i;
-
   int start = failures;
 
   printf("t_spurious_record\n");
-  mount("work.d64");
+  mount(work_path);
 
   /* record 3 holds 54 data bytes, the rest of the record (which
      spans into the next sector) is zero-filled */
@@ -1261,8 +1297,8 @@ static void t_spurious_record(void) {
     }
   }
   rel_close(buf);
-  unmount_and_save("work.d64");
-  mount("work.d64");
+  commit_image();
+  mount(work_path);
   buf = rel_open("E2", L, 0);
   if (!buf) {
     CHECK(0, "reopen failed (error %d)", current_error);
@@ -1284,7 +1320,7 @@ static void t_spurious_record(void) {
   }
 
   rel_close(buf);
-  unmount_and_save("work.d64");
+  commit_image();
 }
 
 static void t_overflow_then_write(void) {
@@ -1293,7 +1329,7 @@ static void t_overflow_then_write(void) {
   int n;
 
   printf("t_overflow_then_write\n");
-  mount("work.d64");
+  mount(work_path);
 
   buf = rel_open("E3", 20, 1);
   if (!buf) {
@@ -1313,8 +1349,8 @@ static void t_overflow_then_write(void) {
   fill_data(data, 20, 22);
   CHECK(bus_write(buf, data, 20) == 0, "write 3 failed");
   rel_close(buf);
-  unmount_and_save("work.d64");
-  mount("work.d64");
+  commit_image();
+  mount(work_path);
   buf = rel_open("E3", 20, 0);
   if (!buf) {
     CHECK(0, "reopen failed (error %d)", current_error);
@@ -1336,16 +1372,16 @@ static void t_overflow_then_write(void) {
   CHECK(memcmp(back, data, 20) == 0, "record 3 mismatch");
 
   rel_close(buf);
-  unmount_and_save("work.d64");
+  commit_image();
 }
 
-static void t_d71_limit(void) {
+static void t_d71_limit(const char *img) {
   const uint8_t L = 254;
   uint8_t data[254];
   buffer_t *buf;
 
   printf("t_d71_limit\n");
-  mount("blank.d71");
+  mount(img);
 
   buf = rel_open("D1", L, 1);
   if (!buf) {
@@ -1362,7 +1398,7 @@ static void t_d71_limit(void) {
   CHECK_ERR(ERROR_FILE_TOO_LARGE);
 
   rel_close(buf);
-  unmount_and_save("work.d71");
+  commit_image();
 }
 
 
@@ -1372,7 +1408,7 @@ static void t_last_record_size(void) {
   int n;
 
   printf("t_last_record_size\n");
-  mount("work.d64");
+  mount(work_path);
 
   /* a fresh L=20 file holds 12 records in one data sector */
   buf = rel_open("L1", 20, 1);
@@ -1390,8 +1426,8 @@ static void t_last_record_size(void) {
   CHECK(buf->pvt.d64.record_max == 12, "record_max grew to %d",
         buf->pvt.d64.record_max);
   rel_close(buf);
-  unmount_and_save("work.d64");
-  mount("work.d64");
+  commit_image();
+  mount(work_path);
 
   /* the written record is there, reading past it reports error 50 */
   buf = rel_open("L1", 20, 0);
@@ -1413,7 +1449,7 @@ static void t_last_record_size(void) {
   rel_close(buf);
 
   /* appending without a P command grows the file again */
-  mount("work.d64");
+  mount(work_path);
   buf = rel_open("L1", 20, 0);
   if (!buf) {
     CHECK(0, "reopen failed (error %d)", current_error);
@@ -1426,9 +1462,9 @@ static void t_last_record_size(void) {
   CHECK(bus_write(buf, data, 20) == 0, "append failed");
   CHECK(buf->pvt.d64.record_max >= 13, "record_max %d", buf->pvt.d64.record_max);
   rel_close(buf);
-  unmount_and_save("work.d64");
+  commit_image();
 
-  mount("work.d64");
+  mount(work_path);
   buf = rel_open("L1", 20, 0);
   if (!buf) {
     CHECK(0, "reopen failed (error %d)", current_error);
@@ -1442,17 +1478,17 @@ static void t_last_record_size(void) {
   CHECK(memcmp(back, data, 20) == 0, "appended record mismatch");
   rel_close(buf);
 
-  unmount_and_save("work.d64");
+  commit_image();
 }
 
-static void t_d71_last_record(void) {
+static void t_d71_last_record(const char *img) {
   const uint8_t L = 254;
   uint8_t data[254], back[300];
   buffer_t *buf;
   int n;
 
   printf("t_d71_last_record\n");
-  mount("blank.d71");
+  mount(img);
 
   /* grow to the 720 data sector limit: record 720 is the last one */
   buf = rel_open("D2", L, 1);
@@ -1475,9 +1511,9 @@ static void t_d71_last_record(void) {
   fill_data(data, L, 13);
   CHECK(bus_write(buf, data, L) == 0, "rewrite at limit failed");
   rel_close(buf);
-  unmount_and_save("work.d71");
+  commit_image();
 
-  mount("work.d71");
+  mount(img);
   buf = rel_open("D2", L, 0);
   if (!buf) {
     CHECK(0, "reopen failed (error %d)", current_error);
@@ -1491,7 +1527,7 @@ static void t_d71_last_record(void) {
   CHECK(memcmp(back, data, L) == 0, "record 720 mismatch");
   rel_close(buf);
 
-  unmount_and_save("work.d71");
+  commit_image();
 }
 
 static void t_readonly(void) {
@@ -1499,7 +1535,7 @@ static void t_readonly(void) {
   buffer_t *buf;
 
   printf("t_readonly\n");
-  mount("work.d64");
+  mount(work_path);
 
   /* make the image read-only */
   partition[0].imagehandle.flag &= (uint8_t)~FA_WRITE;
@@ -1554,11 +1590,10 @@ static void t_read_after_overflow(void) {
   uint8_t data[254], big[300], back[300];
   buffer_t *buf;
   int n, i;
-
   int start = failures;
 
   printf("t_read_after_overflow\n");
-  mount("work.d64");
+  mount(work_path);
 
   /* five full records, then an overlong write to record 1 that wraps
      across sector boundaries */
@@ -1603,7 +1638,306 @@ static void t_read_after_overflow(void) {
   CHECK(memcmp(back, data, L) == 0, "record 1 mismatch");
 
   rel_close(buf);
-  unmount_and_save("work.d64");
+  commit_image();
+}
+
+/* ------------------------------------------------------------------ */
+/*  FAT REL tests (characterization tests marked QUIRK assert the     */
+/*  current behaviour even where it differs from a 1541)              */
+/* ------------------------------------------------------------------ */
+
+static void t_fat_create_write_read(void) {
+  uint8_t data[254], back[300];
+  char freln[512];
+  buffer_t *buf;
+  int n;
+  FILE *f;
+
+  printf("t_fat_create_write_read\n");
+  fat_reset();
+  file_extension_mode = 1;
+  snprintf(freln, sizeof(freln), "%s/frel.R00", fatroot_base);
+
+  buf = fat_open("FREL,L,", 20, 2);
+  if (!buf) {
+    CHECK(0, "create failed (error %d)", current_error);
+    return;
+  }
+  CHECK(buf->recordlen == 20, "recordlen %d", buf->recordlen);
+  CHECK(buf->write, "not opened for write");
+
+  fill_data(data, 20, 1);
+  CHECK(bus_write(buf, data, 20) == 0, "write 1 failed");
+  fill_data(data, 10, 2);
+  CHECK(bus_write(buf, data, 10) == 0, "write 2 failed");
+  fill_data(data, 20, 3);
+  CHECK(bus_write(buf, data, 20) == 0, "write 3 failed");
+
+  fat_close(buf);
+
+  /* QUIRK: a short written record is zero-filled to the record
+     length; the file holds the 26-byte header plus three records */
+  f = fopen(freln, "rb");
+  CHECK(f != NULL, "host file frel.R00 missing");
+  if (f) {
+    uint8_t raw[100];
+    size_t got = fread(raw, 1, sizeof(raw), f);
+    fclose(f);
+    CHECK(got == 86, "file size %d, expected 86", (int)got);
+    CHECK(memcmp(raw, "C64File", 7) == 0, "marker mismatch");
+    CHECK(raw[25] == 20, "header record length %d", raw[25]);
+    fill_data(data, 20, 1);
+    CHECK(memcmp(raw + 26, data, 20) == 0, "record 1 mismatch");
+    fill_data(data, 10, 2);
+    CHECK(memcmp(raw + 46, data, 10) == 0, "record 2 mismatch");
+    {
+      static const uint8_t zeros[10];
+      CHECK(memcmp(raw + 56, zeros, 10) == 0, "record 2 not zero-filled");
+    }
+    fill_data(data, 20, 3);
+    CHECK(memcmp(raw + 66, data, 20) == 0, "record 3 mismatch");
+  }
+
+  /* reopen and read back */
+  fat_mount();
+  buf = fat_open("FREL,L,", 20, 2);
+  if (!buf) {
+    CHECK(0, "reopen failed (error %d)", current_error);
+    return;
+  }
+  rel_position(buf, 1, 1);
+  fill_data(data, 20, 1);
+  n = bus_read_record(buf, back, sizeof(back));
+  CHECK(n == 20 && memcmp(back, data, 20) == 0, "record 1 readback");
+
+  rel_position(buf, 2, 1);
+  fill_data(data, 10, 2);
+  n = bus_read_record(buf, back, sizeof(back));
+  CHECK(n == 10 && memcmp(back, data, 10) == 0, "record 2 readback");
+
+  /* sequential read advances to record 3 */
+  fill_data(data, 20, 3);
+  n = bus_read_record(buf, back, sizeof(back));
+  CHECK(n == 20 && memcmp(back, data, 20) == 0, "record 3 readback");
+
+  /* QUIRK: reading a record past the end of the file delivers one
+     stale byte, and the refill towards the next record latches
+     ERROR_RECORD_MISSING (the D64 path reports it on the seek) */
+  rel_position(buf, 4, 1);
+  set_error(ERROR_OK);
+  n = bus_read_record(buf, back, sizeof(back));
+  CHECK(n == 1, "past-eof delivered %d bytes", n);
+  CHECK_ERR(ERROR_RECORD_MISSING);
+
+  fat_close(buf);
+  file_extension_mode = 0;
+}
+
+/* QUIRK: with extension mode 0 a REL file is stored without a type
+   marker, so reopening it by name reports FILE EXISTS (the scan lists
+   it as PRG) instead of reopening as REL. */
+static void t_fat_raw_exists(void) {
+  uint8_t data[254];
+  char frawln[512];
+  buffer_t *buf;
+  FILE *f;
+
+  printf("t_fat_raw_exists\n");
+  fat_reset();
+  snprintf(frawln, sizeof(frawln), "%s/fraw", fatroot_base);
+
+  buf = fat_open("FRAW,L,", 20, 2);
+  if (!buf) {
+    CHECK(0, "create failed (error %d)", current_error);
+    return;
+  }
+  fill_data(data, 20, 12);
+  CHECK(bus_write(buf, data, 20) == 0, "write failed");
+  fat_close(buf);
+
+  /* the raw file holds the record length byte plus one record */
+  f = fopen(frawln, "rb");
+  CHECK(f != NULL, "host file fraw missing");
+  if (f) {
+    uint8_t raw[32];
+    size_t got = fread(raw, 1, sizeof(raw), f);
+    fclose(f);
+    CHECK(got == 21, "file size %d, expected 21", (int)got);
+    CHECK(raw[0] == 20, "record length byte %d", raw[0]);
+    fill_data(data, 20, 12);
+    CHECK(memcmp(raw + 1, data, 20) == 0, "record 1 mismatch");
+  }
+
+  fat_mount();
+  buf = fat_open("FRAW,L,", 20, 2);
+  if (!buf) {
+    CHECK_ERR(ERROR_FILE_EXISTS);
+    return;
+  }
+  CHECK(0, "raw reopen unexpectedly succeeded");
+  fat_close(buf);
+}
+
+static void t_fat_reopen_mismatch(void) {
+  uint8_t data[254], back[300];
+  buffer_t *buf;
+  int n;
+
+  printf("t_fat_reopen_mismatch\n");
+  fat_reset();
+  file_extension_mode = 1;
+
+  buf = fat_open("FMIS,L,", 20, 2);
+  if (!buf) {
+    CHECK(0, "create failed (error %d)", current_error);
+    return;
+  }
+  fill_data(data, 20, 66);
+  CHECK(bus_write(buf, data, 20) == 0, "write failed");
+  fat_close(buf);
+
+  fat_mount();
+
+  /* QUIRK: reopening with a different record length reports error 50
+     but uses the REQUESTED record length, not the stored one */
+  buf = fat_open("FMIS,L,", 25, 2);
+  if (!buf) {
+    CHECK(0, "reopen failed (error %d)", current_error);
+    return;
+  }
+  CHECK_ERR(ERROR_RECORD_MISSING);
+  CHECK(buf->recordlen == 25, "recordlen %d", buf->recordlen);
+
+  rel_position(buf, 1, 1);
+  fill_data(data, 20, 66);
+  n = bus_read_record(buf, back, sizeof(back));
+  /* the stored record is 20 bytes, so only 20 are delivered even
+     though the buffer uses the requested record length of 25 */
+  CHECK(n == 20 && memcmp(back, data, 20) == 0, "record 1 read");
+  fat_close(buf);
+  file_extension_mode = 0;
+}
+
+static void t_fat_spill(void) {
+  uint8_t data[254], back[300];
+  char fspillln[512];
+  buffer_t *buf;
+  FILE *f;
+  int n;
+
+  printf("t_fat_spill\n");
+  fat_reset();
+  file_extension_mode = 1;
+  snprintf(fspillln, sizeof(fspillln), "%s/fspill.R00", fatroot_base);
+
+  buf = fat_open("FSPILL,L,", 20, 2);
+  if (!buf) {
+    CHECK(0, "create failed (error %d)", current_error);
+    return;
+  }
+
+  /* QUIRK: unlike the D64 path, an overlong FAT REL write reports no
+     overflow error. write_data truncates the transfer to one record,
+     so the trailing 10 bytes are silently dropped. */
+  fill_data(data, 30, 8);
+  CHECK(bus_write(buf, data, 30) == 0, "overlong write failed");
+  CHECK_ERR(ERROR_OK);
+  fat_close(buf);
+
+  f = fopen(fspillln, "rb");
+  CHECK(f != NULL, "host file fspill.R00 missing");
+  if (f) {
+    uint8_t raw[100];
+    size_t got = fread(raw, 1, sizeof(raw), f);
+    fclose(f);
+    CHECK(got == 46, "file size %d, expected 46 (header + one record)", (int)got);
+    fill_data(data, 20, 8);
+    CHECK(memcmp(raw + 26, data, 20) == 0, "record 1 mismatch");
+  }
+
+  fat_mount();
+  buf = fat_open("FSPILL,L,", 20, 2);
+  if (!buf) {
+    CHECK(0, "reopen failed (error %d)", current_error);
+    return;
+  }
+
+  rel_position(buf, 1, 1);
+  fill_data(data, 20, 8);
+  n = bus_read_record(buf, back, sizeof(back));
+  CHECK(n == 20 && memcmp(back, data, 20) == 0, "record 1 mismatch");
+
+  /* the dropped bytes left record 2 absent: reading past EOF delivers
+     one stale byte and the refill towards the next record latches
+     ERROR_RECORD_MISSING */
+  rel_position(buf, 2, 1);
+  set_error(ERROR_OK);
+  n = bus_read_record(buf, back, sizeof(back));
+  CHECK(n == 1, "record 2 delivered %d bytes", n);
+  CHECK_ERR(ERROR_RECORD_MISSING);
+
+  fat_close(buf);
+  file_extension_mode = 0;
+}
+
+/* The x00 detection identifies an R00 file by the CBM name in its
+   header, independent of the host file name */
+static void t_fat_x00(void) {
+  uint8_t data[254], back[300];
+  char xreln[512], renamed[512];
+  buffer_t *buf;
+  int n;
+  FILE *f;
+  uint8_t header[26];
+
+  printf("t_fat_x00\n");
+  fat_reset();
+  snprintf(xreln, sizeof(xreln), "%s/xrel.R00", fatroot_base);
+  snprintf(renamed, sizeof(renamed), "%s/other.r00", fatroot_base);
+
+  /* extension mode 1: the REL file is stored as an R00 file with the
+     P00-style header and the record length at offset 25 */
+  file_extension_mode = 1;
+
+  buf = fat_open("XREL,L,", 15, 2);
+  if (!buf) {
+    CHECK(0, "create failed (error %d)", current_error);
+    return;
+  }
+  fill_data(data, 15, 5);
+  CHECK(bus_write(buf, data, 15) == 0, "write failed");
+  fat_close(buf);
+
+  f = fopen(xreln, "rb");
+  CHECK(f != NULL, "host file xrel.R00 missing");
+  if (f) {
+    size_t got = fread(header, 1, sizeof(header), f);
+    fclose(f);
+    CHECK(got == 26, "header size %d", (int)got);
+    CHECK(memcmp(header, "C64File", 7) == 0, "marker mismatch");
+    CHECK(memcmp(header + 8, "XREL", 5) == 0, "internal name mismatch");
+    CHECK(header[25] == 15, "record length byte %d", header[25]);
+  }
+
+  /* reopen under a different host name: the scan matches the file by
+     the internal name in the header */
+  /* parenthesized: the firmware headers define a rename() macro */
+  CHECK((rename)(xreln, renamed) == 0, "rename failed");
+  fat_mount();
+  buf = fat_open("XREL,L,", 15, 2);
+  if (!buf) {
+    CHECK(0, "reopen failed (error %d)", current_error);
+    return;
+  }
+  CHECK(buf->recordlen == 15, "recordlen %d", buf->recordlen);
+
+  rel_position(buf, 1, 1);
+  fill_data(data, 15, 5);
+  n = bus_read_record(buf, back, sizeof(back));
+  CHECK(n == 15 && memcmp(back, data, 15) == 0, "record 1 readback");
+  fat_close(buf);
+
+  file_extension_mode = 0;
 }
 
 static void t_c1541_image(const char *image) {
@@ -1612,7 +1946,7 @@ static void t_c1541_image(const char *image) {
   int n, i;
 
   printf("t_c1541_image\n");
-  mount(image);
+  mount_fixture(image);
 
   buf = rel_open("MYREL", 50, 0);
   if (!buf) {
@@ -1672,17 +2006,19 @@ static int make_dataless_rel(const char *name, uint8_t recordlen) {
   if (write_entry(0, &dent.pvt.dxx.dh, ops_scratch, 1))
     return 0;
 
-  d64_bam_commit();
+  commit_image();
   return 1;
 }
 
 /* Opening a REL file without data sectors, also with a mismatched
    record length */
-static void t_dataless_open(const char *image) {
+static void t_dataless_open(void) {
+  char path[512];
   buffer_t *buf;
 
   printf("t_dataless_open\n");
-  mount(image);
+  fresh_image(path, sizeof(path), "dataless.d64");
+  mount(path);
   CHECK(make_dataless_rel("Z0", RECLEN), "setup failed (error %d)", current_error);
 
   /* an empty file opens without an error */
@@ -1721,7 +2057,8 @@ static void t_dataless_open(const char *image) {
 }
 
 /* The first write to a REL file without data sectors allocates one */
-static void t_dataless_grow(const char *image) {
+static void t_dataless_grow(void) {
+  char path[512];
   uint8_t data[254], back[300];
   path_t p;
   cbmdirent_t dent;
@@ -1731,7 +2068,8 @@ static void t_dataless_grow(const char *image) {
   int n;
 
   printf("t_dataless_grow\n");
-  mount(image);
+  fresh_image(path, sizeof(path), "dataless.d64");
+  mount(path);
   CHECK(make_dataless_rel("Z1", RECLEN), "setup failed (error %d)", current_error);
   before = d64_freeblocks(0);
 
@@ -1745,7 +2083,7 @@ static void t_dataless_grow(const char *image) {
   CHECK(buf->pvt.d64.record_max == 254 / RECLEN,
         "record_max %d", buf->pvt.d64.record_max);
   rel_close(buf);
-  d64_bam_commit();
+  commit_image();
 
   after = d64_freeblocks(0);
   CHECK(before - after == 1, "allocated %d blocks", before - after);
@@ -1788,7 +2126,7 @@ static void t_dataless_grow(const char *image) {
   /* scratch follows the data chain from the directory entry and frees
      the data and side sector blocks */
   CHECK(d64_delete(&p, &dent) == 1, "delete failed (error %d)", current_error);
-  d64_bam_commit();
+  commit_image();
   CHECK(d64_freeblocks(0) == before + 1,
         "free blocks %d after scratch, expected %d", d64_freeblocks(0), before + 1);
 }
@@ -1813,19 +2151,20 @@ static void copy_file(const char *src, const char *dst) {
 }
 
 int main(int argc, char **argv) {
-  const char *datadir = argc > 1 ? argv[1] : ".";
   char blank[512];
   char ref[512];
 
   buffers_init();
   set_error(ERROR_OK);
 
-  snprintf(blank, sizeof(blank), "%s/blank.d64", datadir);
-  snprintf(ref,   sizeof(ref),   "%s/c1541.d64", datadir);
+  snprintf(data_dir, sizeof(data_dir), "%s", argc > 1 ? argv[1] : "testdata");
+  snprintf(blank, sizeof(blank), "%s/blank.d64", data_dir);
+  snprintf(ref,   sizeof(ref),   "%s/c1541.d64", data_dir);
+  snprintf(work_path, sizeof(work_path), "%s/work.d64", data_dir);
 
   /* the D64 tests share one working copy of the blank image, later
      tests and validate.py build on the files written by earlier ones */
-  copy_file(blank, "work.d64");
+  copy_file(blank, work_path);
 
   t_create_and_write();
   t_partial_and_seek();
@@ -1848,37 +2187,35 @@ int main(int argc, char **argv) {
   t_last_record_size();
   t_readonly();
   t_read_after_overflow();
-
-  /* REL files without data sectors, each on a fresh copy of the blank
-     image */
-  copy_file(blank, "dataless.d64");
-  t_dataless_open("dataless.d64");
-  copy_file(blank, "dataless.d64");
-  t_dataless_grow("dataless.d64");
+  t_dataless_open();
+  t_dataless_grow();
+  t_fat_create_write_read();
+  t_fat_reopen_mismatch();
+  t_fat_spill();
+  t_fat_raw_exists();
+  t_fat_x00();
 
   /* open the python-created multi-record image */
-  {
-    char multi[512];
-    snprintf(multi, sizeof(multi), "%s/multi.d64", datadir);
-    copy_file(multi, "multi.d64");
-    t_multirel_open();
-  }
+  t_multirel_open();
 
   /* D81 exercises the super side sector paths */
   {
-    char blank81[512];
-    snprintf(blank81, sizeof(blank81), "%s/blank.d81", datadir);
-    copy_file(blank81, "blank.d81");
-    t_d81_groups();
+    char blank81[512], work81[512];
+    snprintf(blank81, sizeof(blank81), "%s/blank.d81", data_dir);
+    snprintf(work81,  sizeof(work81),  "%s/work.d81", data_dir);
+    copy_file(blank81, work81);
+    t_d81_groups(work81);
   }
 
   /* D71: growth limit and last-record handling at the limit */
   {
-    char blank71[512];
-    snprintf(blank71, sizeof(blank71), "%s/blank.d71", datadir);
-    copy_file(blank71, "blank.d71");
-    t_d71_limit();
-    t_d71_last_record();
+    char blank71[512], work71[512];
+    snprintf(blank71, sizeof(blank71), "%s/blank.d71", data_dir);
+    snprintf(work71,  sizeof(work71),  "%s/work.d71", data_dir);
+    copy_file(blank71, work71);
+    t_d71_limit(work71);
+    copy_file(blank71, work71);
+    t_d71_last_record(work71);
   }
 
   /* cross-check against an image created by the c1541 tool */
