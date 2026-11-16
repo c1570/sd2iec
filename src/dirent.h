@@ -181,6 +181,11 @@ typedef struct {
   } pvt;
 } cbmdirent_t;
 
+/* REL file state flags for d64fh.relflags */
+#define REL_FLAG_GROW     1  /* position is past EOF, the next write extends the file */
+#define REL_FLAG_SUPER    2  /* dir entry points to a super side sector (D81/DNP)   */
+#define REL_FLAG_OVERFLOW 4  /* write overflow seen, discard until the next seek    */
+
 /**
  * struct d64fh - D64 file handle
  * @dh    : d64dh pointing to the directory entry
@@ -188,6 +193,13 @@ typedef struct {
  * @track : current track
  * @sector: current sector
  * @blocks: number of sectors allocated before the current
+ *          (REL: number of sectors allocated to the file)
+ * @sstrack   : track of the first side sector (REL only, super side sector if any)
+ * @sssector  : sector of the first side sector (REL only, super side sector if any)
+ * @record    : current record number, 0-based (REL only)
+ * @record_max: number of complete records in the file (REL only)
+ * @relstart  : buffer position where the current record transfer started (REL only)
+ * @relflags  : REL file state flags, see REL_FLAG_* defines
  *
  * This structure holds the information required to write to a file
  * in a D64 image and update its directory entry upon close.
@@ -198,6 +210,12 @@ typedef struct d64fh {
   uint8_t track;
   uint8_t sector;
   uint16_t blocks;
+  uint8_t  sstrack;
+  uint8_t  sssector;
+  uint16_t record;
+  uint16_t record_max;
+  uint8_t  relstart;
+  uint8_t  relflags;
 } d64fh_t;
 
 /**

@@ -373,10 +373,13 @@ static uint8_t iec_listen_handler(const uint8_t cmd) {
       if (buf->position == 0)
         buf->mustflush = 1;
 
-      /* REL files must be syncronized on EOI */
-      if(buf->recordlen && (iec_data.iecflags & EOI_RECVD))
+      /* REL files must be syncronized on EOI. Clearing mustflush
+         tells the callback that the transfer ended with this EOI. */
+      if(buf->recordlen && (iec_data.iecflags & EOI_RECVD)) {
+        buf->mustflush = 0;
         if (buf->refill(buf))
           return 1;
+      }
     }
   }
 }

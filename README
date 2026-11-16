@@ -743,11 +743,14 @@ use P00 headers even when the file type is SEQ or USR.
 
 REL files:
 ==========
-Partial REL file support is implemented. It should work fine for existing
-files, but creating new files and/or adding records to existing files
-may fail. REL files in disk images are not supported yet, only as files
-on a FAT medium. When x00 support is disabled the first byte of a REL
-file is assumed to be the record length.
+REL files are supported on FAT media and on disk images (D64/D71/D81/
+DNP). Records can be positioned with the P command and files can be
+created and extended. D64 and D71 images use the 1541/1571 side sector
+layout, D81 and DNP images add the 1581 super side sector. DNP support
+follows the D81 code path and is less tested than the other formats.
+REL files on M2I and EEPROM are not supported. When x00 support is
+disabled the first byte of a REL file is assumed to be the record
+length.
 
 Changing Disk Images
 ====================

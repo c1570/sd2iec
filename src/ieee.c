@@ -471,8 +471,10 @@ static int16_t ieee_listen_handler (uint8_t cmd)
       /* Mark buffer for flushing if position wrapped */
       if (buf->position == 0) buf->mustflush = 1;
 
-      /* REL files must be syncronized on EOI */
+      /* REL files must be syncronized on EOI. Clearing mustflush
+         tells the callback that the transfer ended with this EOI. */
       if(buf->recordlen && (ieee_data.ieeeflags & EOI_RECVD)) {
+        buf->mustflush = 0;
         if (buf->refill(buf)) return -2;
       }
     }   /* else-buffer */

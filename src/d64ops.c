@@ -1452,9 +1452,45 @@ static void d64_open_read(path_t *path, cbmdirent_t *dent, buffer_t *buf) {
   buf->refill(buf);
 }
 
+/**
+ * create_entry - prepare the directory entry of a new file
+ * @path: path of the file
+ * @dent: name of the file
+ * @type: file type byte of the entry
+ * @dh  : receives the handle of the new directory entry
+ * @t   : receives the track of the first data sector
+ * @s   : receives the sector of the first data sector
+ *
+ * Finds an empty directory entry, builds the new entry in ops_scratch
+ * and allocates the first data sector of the file. The entry is not
+ * written to the image.
+ * Returns 0 if successful, != 0 otherwise.
+ */
+static uint8_t create_entry(path_t *path, cbmdirent_t *dent, uint8_t type,
+                            dh_t *dh, uint8_t *t, uint8_t *s) {
+  uint8_t *name = dent->name;
+  uint8_t *ptr  = ops_scratch + DIR_OFS_FILE_NAME;
+
+  if (find_empty_entry(path, dh))
+    return 1;
+
+  memset(ops_scratch + 2, 0, sizeof(ops_scratch) - 2);  /* Don't overwrite the link pointer! */
+  memset(ops_scratch + DIR_OFS_FILE_NAME, 0xa0, CBM_NAME_LENGTH);
+  while (*name) *ptr++ = *name++;
+  ops_scratch[DIR_OFS_FILE_TYPE] = type;
+
+  /* Find a free sector and allocate it */
+  if (get_first_sector(path->part, t, s))
+    return 1;
+
+  ops_scratch[DIR_OFS_TRACK]  = *t;
+  ops_scratch[DIR_OFS_SECTOR] = *s;
+
+  return allocate_sector(path->part, *t, *s);
+}
+
 static void d64_open_write(path_t *path, cbmdirent_t *dent, uint8_t type, buffer_t *buf, uint8_t append) {
   dh_t dh;
-  uint8_t *ptr;
 
   /* Check for read-only image file */
   if (!(partition[path->part].imagehandle.flag & FA_WRITE)) {
@@ -1491,30 +1527,10 @@ static void d64_open_write(path_t *path, cbmdirent_t *dent, uint8_t type, buffer
     return;
   }
 
-  /* Non-append case */
-
-  /* Search for an empty directory entry */
-  if (find_empty_entry(path, &dh))
-    return;
-
-  /* Create directory entry in ops_scratch */
-  uint8_t *name = dent->name;
-  memset(ops_scratch + 2, 0, sizeof(ops_scratch) - 2);  /* Don't overwrite the link pointer! */
-  memset(ops_scratch + DIR_OFS_FILE_NAME, 0xa0, CBM_NAME_LENGTH);
-  ptr = ops_scratch + DIR_OFS_FILE_NAME;
-  while (*name) *ptr++ = *name++;
-  ops_scratch[DIR_OFS_FILE_TYPE] = type;
-
-  /* Find a free sector and allocate it */
+  /* Non-append case: create the directory entry in ops_scratch */
   uint8_t t,s;
 
-  if (get_first_sector(path->part,&t,&s))
-    return;
-
-  ops_scratch[DIR_OFS_TRACK]  = t;
-  ops_scratch[DIR_OFS_SECTOR] = s;
-
-  if (allocate_sector(path->part,t,s))
+  if (create_entry(path, dent, type, &dh, &t, &s))
     return;
 
   /* Write the directory entry */
@@ -1536,7 +1552,1071 @@ static void d64_open_write(path_t *path, cbmdirent_t *dent, uint8_t type, buffer
   buf->pvt.d64.sector = s;
 }
 
+/* Upper bound for following a file's sector chain in d64_delete, larger
+   than the number of sectors in any supported image */
+#define FILE_CHAIN_LIMIT    65536ul
+
+#ifdef CONFIG_D64_REL
+/* ------------------------------------------------------------------------- */
+/*  REL file handling                                                        */
+/* ------------------------------------------------------------------------- */
+/* CONFIG_D64_REL controls whether REL files on disk images are supported;
+   without it d64_open_rel reports an error and the side sectors of a
+   deleted file are left to be recycled by the image's format operation. */
+
+/* Offsets in a side sector block */
+#define SS_OFS_NEXT_TRACK   0
+#define SS_OFS_NEXT_SECTOR  1
+#define SS_OFS_NUMBER       2
+#define SS_OFS_RECORD_SIZE  3
+#define SS_OFS_FIRST_SS     4   /* t/s of side sector 0, repeated for SS1-SS5 */
+#define SS_OFS_POINTER      16  /* first data sector pointer */
+#define SS_INDICES          120 /* data sector pointers per side sector */
+#define SS_SIDE_SECTORS     6   /* side sectors per group */
+#define SS_SUPER_GROUPS     126 /* group entries in a super side sector */
+
+/* Upper bound for following the side sector chain, larger than the
+   number of side sector blocks in any supported image */
+#define SS_CHAIN_LIMIT      768
+
+/* The super side sector stores the head of each group's chain at this
+   offset instead of a record size; bytes 0/1 point to the first group. */
+#define SS_OFS_SUPER_POINTER 3
+
+#define REL_SUPER_MARKER    254 /* side sector number of a super side sector */
+
+/* Read a full sector, flagging an illegal t/s link on range errors */
+static uint8_t rel_read(uint8_t part, uint8_t track, uint8_t sector, uint8_t *data) {
+  return checked_read(part, track, sector, data, 256, ERROR_ILLEGAL_TS_LINK);
+}
+
+/* Write a full sector */
+static uint8_t rel_write(uint8_t part, uint8_t track, uint8_t sector, uint8_t *data) {
+  return image_write(part, sector_offset(part, track, sector), data, 256, 1);
+}
+
+/* Write the buffer's data sector to the image if it holds changes */
+static uint8_t rel_commit(buffer_t *buf) {
+  if (buf->dirty) {
+    if (rel_write(buf->pvt.d64.part, buf->pvt.d64.track, buf->pvt.d64.sector,
+                  buf->data))
+      return 1;
+    mark_buffer_clean(buf);
+  }
+  return 0;
+}
+
+/* Discard uncommitted changes to the buffer's data sector from
+   position @pos on by reading that part back from the image */
+static uint8_t rel_restore(buffer_t *buf, uint8_t pos) {
+  uint8_t part = buf->pvt.d64.part;
+
+  return image_read(part, sector_offset(part, buf->pvt.d64.track,
+                                        buf->pvt.d64.sector) + pos,
+                    buf->data + pos, 256 - pos);
+}
+
+/* Buffer position of a file offset within its data sector */
+static uint8_t rel_pos(uint32_t offset) {
+  return 2 + offset % 254;
+}
+
+/* File offset of the first byte of a record */
+static uint32_t rel_offset(buffer_t *buf, uint16_t record) {
+  return (uint32_t)record * buf->recordlen;
+}
+
+/**
+ * rel_read_sidesector - read a side sector block into the buffer data area
+ * @buf: buffer of an open REL file
+ * @dsec: data sector index to locate
+ * @sst : receives the track of the side sector block (may be NULL)
+ * @sss : receives the sector of the side sector block (may be NULL)
+ *
+ * This function reads the side sector block that holds the track/sector
+ * pointer of data sector number @dsec into buf->data, following the
+ * side sector chain (or the super side sector if present).
+ * Returns a pointer to the track/sector entry of data sector @dsec in
+ * buf->data if successful, NULL otherwise.
+ */
+static uint8_t *rel_read_sidesector(buffer_t *buf, uint16_t dsec,
+                                    uint8_t *sst, uint8_t *sss) {
+  uint8_t part   = buf->pvt.d64.part;
+  uint8_t track  = buf->pvt.d64.sstrack;
+  uint8_t sector = buf->pvt.d64.sssector;
+  uint16_t block = dsec / SS_INDICES;
+  uint8_t  index = dsec % SS_INDICES;
+
+  if (buf->pvt.d64.relflags & REL_FLAG_SUPER) {
+    uint8_t group = block / SS_SIDE_SECTORS;
+
+    if (rel_read(part, track, sector, buf->data))
+      return NULL;
+
+    if (buf->data[SS_OFS_NUMBER] != REL_SUPER_MARKER) {
+      set_error(ERROR_IMAGE_INVALID);
+      return NULL;
+    }
+
+    track  = buf->data[SS_OFS_SUPER_POINTER + 2 * group];
+    sector = buf->data[SS_OFS_SUPER_POINTER + 1 + 2 * group];
+    block %= SS_SIDE_SECTORS;
+  }
+
+  /* Follow the side sector chain; the walk takes at most @block steps,
+     so a cyclic chain cannot hang it */
+  while (1) {
+    if (rel_read(part, track, sector, buf->data))
+      return NULL;
+
+    if (block == 0) {
+      if (sst != NULL)
+        *sst = track;
+      if (sss != NULL)
+        *sss = sector;
+      return buf->data + SS_OFS_POINTER + 2 * index;
+    }
+
+    block--;
+    track  = buf->data[SS_OFS_NEXT_TRACK];
+    sector = buf->data[SS_OFS_NEXT_SECTOR];
+    if (track == 0) {
+      set_error_ts(ERROR_ILLEGAL_TS_LINK, track, sector);
+      return NULL;
+    }
+  }
+}
+
+/**
+ * rel_load_data_sector - load a REL file data sector into the buffer
+ * @buf: buffer of an open REL file
+ * @dsec: data sector index
+ *
+ * Locates data sector @dsec using the side sector chain and reads it
+ * into buf->data. Returns 0 if successful, != 0 otherwise.
+ */
+static uint8_t rel_load_data_sector(buffer_t *buf, uint16_t dsec) {
+  uint8_t track, sector;
+
+  uint8_t *entry = rel_read_sidesector(buf, dsec, NULL, NULL);
+
+  if (entry == NULL)
+    return 1;
+
+  track  = entry[0];
+  sector = entry[1];
+
+  if (track == 0) {
+    set_error(ERROR_RECORD_MISSING);
+    return 1;
+  }
+
+  buf->pvt.d64.track  = track;
+  buf->pvt.d64.sector = sector;
+
+  return rel_read(buf->pvt.d64.part, track, sector, buf->data);
+}
+
+/* Load the data sector holding the current file position */
+static uint8_t rel_load_fptr(buffer_t *buf) {
+  return rel_load_data_sector(buf, buf->fptr / 254);
+}
+
+/**
+ * rel_write_empty - write an empty data sector of a REL file
+ * @buf : buffer of the REL file, its data area is overwritten
+ * @dsec: index of the data sector within the file
+ * @t   : track of the data sector
+ * @s   : sector of the data sector
+ *
+ * Fills the data area with the empty record pattern - bytes at record
+ * boundaries become 0xff and the rest 0x00, matching the pattern a 1541
+ * writes into freshly allocated data sectors - marks the sector as the
+ * last one of the file, using only its complete records, and writes it.
+ * Returns 0 if successful, != 0 otherwise.
+ */
+static uint8_t rel_write_empty(buffer_t *buf, uint16_t dsec, uint8_t t, uint8_t s) {
+  uint8_t length = buf->recordlen;
+  uint8_t pos = ((uint32_t)dsec * 254) % length;
+  uint8_t i = 2;
+
+  do {
+    buf->data[i] = pos ? 0x00 : 0xff;
+    if (++pos == length)
+      pos = 0;
+  } while (++i != 0);
+
+  buf->data[SS_OFS_NEXT_TRACK]  = 0;
+  buf->data[SS_OFS_NEXT_SECTOR] = 255 - pos;
+  return rel_write(buf->pvt.d64.part, t, s, buf->data);
+}
+
+/**
+ * rel_init_sidesector - set up a new side sector block in the buffer
+ * @buf   : buffer whose data area is overwritten
+ * @number: number of the block within its group
+ * @st    : track of the side sector block
+ * @ss    : sector of the side sector block
+ * @t     : track of the first data sector it points to
+ * @s     : sector of the first data sector it points to
+ *
+ * Clears the data area and fills in the header and the first data
+ * sector pointer. The block's own entry in the group table is set,
+ * entries of other blocks in the group are left to the caller.
+ */
+static void rel_init_sidesector(buffer_t *buf, uint8_t number, uint8_t st,
+                                uint8_t ss, uint8_t t, uint8_t s) {
+  memset(buf->data, 0, 256);
+  buf->data[SS_OFS_NEXT_SECTOR] = SS_OFS_POINTER + 1;
+  buf->data[SS_OFS_NUMBER]      = number;
+  buf->data[SS_OFS_RECORD_SIZE] = buf->recordlen;
+  buf->data[SS_OFS_FIRST_SS + 2 * number]     = st;
+  buf->data[SS_OFS_FIRST_SS + 2 * number + 1] = ss;
+  buf->data[SS_OFS_POINTER]     = t;
+  buf->data[SS_OFS_POINTER + 1] = s;
+}
+
+/**
+ * rel_update_dir - store the block count in the directory entry
+ * @buf      : buffer of an open REL file
+ * @timestamp: update the entry timestamp as well
+ *
+ * Reads the directory entry of the file and updates its size field
+ * with the current number of allocated blocks.
+ * Returns 0 if successful, != 0 otherwise.
+ */
+static uint8_t rel_update_dir(buffer_t *buf, uint8_t timestamp) {
+  if (read_entry(buf->pvt.d64.part, &buf->pvt.d64.dh, ops_scratch))
+    return 1;
+
+  ops_scratch[DIR_OFS_SIZE_LOW] = buf->pvt.d64.blocks & 0xff;
+  ops_scratch[DIR_OFS_SIZE_HI]  = buf->pvt.d64.blocks >> 8;
+  if (timestamp)
+    update_timestamp(ops_scratch);
+
+  return write_entry(buf->pvt.d64.part, &buf->pvt.d64.dh, ops_scratch, 1);
+}
+
+/**
+ * rel_patch_ts - store a track/sector pair in a sector of the image
+ * @buf   : buffer of the REL file, its data area is overwritten
+ * @track : track of the sector to change
+ * @sector: sector of the sector to change
+ * @ofs   : offset of the pair within the sector
+ * @t     : track to store
+ * @s     : sector to store
+ *
+ * Returns 0 if successful, != 0 otherwise.
+ */
+static uint8_t rel_patch_ts(buffer_t *buf, uint8_t track, uint8_t sector,
+                            uint8_t ofs, uint8_t t, uint8_t s) {
+  uint8_t part = buf->pvt.d64.part;
+
+  if (rel_read(part, track, sector, buf->data))
+    return 1;
+
+  buf->data[ofs]     = t;
+  buf->data[ofs + 1] = s;
+  return rel_write(part, track, sector, buf->data);
+}
+
+/**
+ * rel_alloc - allocate a sector for a REL file
+ * @buf  : buffer of the REL file
+ * @track: track to start the search at, receives the allocated track
+ * @sector: sector to start the search at, receives the allocated sector
+ *
+ * Allocates the next free sector after @track/@sector and counts it in
+ * the block count of the file.
+ * Returns 0 if successful, != 0 otherwise.
+ */
+static uint8_t rel_alloc(buffer_t *buf, uint8_t *track, uint8_t *sector) {
+  uint8_t part = buf->pvt.d64.part;
+
+  if (get_next_sector(part, track, sector) ||
+      allocate_sector(part, *track, *sector))
+    return 1;
+
+  buf->pvt.d64.blocks++;
+  return 0;
+}
+
+/**
+ * rel_add_data_sector - append a data sector to a REL file
+ * @buf: buffer of an open REL file
+ *
+ * Allocates a new data sector, fills it with the empty record pattern
+ * (0xff as the first byte of every record, 0x00 elsewhere) and adds it
+ * to the side sector structures. Every 120 data sectors a new side
+ * sector block is created; all side sector blocks of a group carry the
+ * same number in their byte 2 and share the pointer table at bytes
+ * 4-15, and a new group is registered in the super side sector of
+ * images that use one. Extends the file to a multiple of the record
+ * length and updates the directory entry size.
+ * Returns 0 if successful, != 0 otherwise.
+ */
+static uint8_t rel_add_data_sector(buffer_t *buf) {
+  uint8_t part = buf->pvt.d64.part;
+  uint8_t length = buf->recordlen;
+  /* With at most 65535 records of up to 254 bytes, the number of data
+     sectors fits into 16 bits */
+  uint16_t n      = ((uint32_t)buf->pvt.d64.record_max * length + 253) / 254;
+  uint16_t ssnum  = n / SS_INDICES;           /* global side sector index */
+  uint8_t  ingroup = ssnum % SS_SIDE_SECTORS; /* index within its group */
+  uint8_t  group  = ssnum / SS_SIDE_SECTORS;
+  uint32_t newmax = (uint32_t)(n + 1) * 254 / length;
+  uint8_t t, s, prevt = 0, prevs = 0, tailt = 0, tails = 0;
+
+  /* The record count is tracked in 16 bits, the super side sector holds
+     at most SS_SUPER_GROUPS group entries and the images without a super
+     side sector support at most six side sector blocks */
+  if (newmax > 65535 ||
+      ssnum >= ((buf->pvt.d64.relflags & REL_FLAG_SUPER) ?
+                SS_SUPER_GROUPS * SS_SIDE_SECTORS : SS_SIDE_SECTORS)) {
+    set_error(ERROR_FILE_TOO_LARGE);
+    return 1;
+  }
+
+  /* Find the position for the new data sector */
+  if (n != 0) {
+    /* data sector n-1 is the last one allocated, so its side sector
+       block is the tail of the chain */
+    uint8_t *entry = rel_read_sidesector(buf, n - 1, &tailt, &tails);
+
+    if (entry == NULL)
+      return 1;
+
+    prevt = entry[0];
+    prevs = entry[1];
+    t = prevt;
+    s = prevs;
+  } else {
+    /* A file without data sectors, start the search at its side sector */
+    t = buf->pvt.d64.sstrack;
+    s = buf->pvt.d64.sssector;
+  }
+
+  if (rel_alloc(buf, &t, &s))
+    return 1;
+
+  if (n % SS_INDICES == 0 && n != 0) {
+    /* A new side sector block is needed */
+    uint8_t st, ss, i;
+    uint8_t table[SS_SIDE_SECTORS * 2];
+
+    st = t;
+    ss = s;
+    if (rel_alloc(buf, &st, &ss))
+      return 1;
+
+    /* Link the tail of the chain to the new block; this continues
+       into the next group */
+    if (rel_patch_ts(buf, tailt, tails, SS_OFS_NEXT_TRACK, st, ss))
+      return 1;
+
+    if (ingroup != 0) {
+      /* Keep the pointer table of the group's first side sector, the
+         new block shares it */
+      if (rel_read_sidesector(buf, n - ingroup * SS_INDICES,
+                              NULL, NULL) == NULL)
+        return 1;
+
+      memcpy(table, buf->data + SS_OFS_FIRST_SS, sizeof(table));
+    }
+
+    /* Initialize the new side sector; the first block of a group is
+       its own head, later ones copy the group table of the first */
+    rel_init_sidesector(buf, ingroup, st, ss, t, s);
+    memcpy(buf->data + SS_OFS_FIRST_SS, table, 2 * ingroup);
+    if (rel_write(part, st, ss, buf->data))
+      return 1;
+
+    if (ingroup == 0) {
+      if (buf->pvt.d64.relflags & REL_FLAG_SUPER) {
+        /* Register the new group in the super side sector */
+        if (rel_patch_ts(buf, buf->pvt.d64.sstrack, buf->pvt.d64.sssector,
+                         SS_OFS_SUPER_POINTER + 2 * group, st, ss))
+          return 1;
+      }
+    } else {
+      /* All previously existing side sectors of the group share the
+         pointer table, add the new block to their tables too */
+      for (i = 0; i < ingroup; i++)
+        if (rel_patch_ts(buf, table[2 * i], table[2 * i + 1],
+                         SS_OFS_FIRST_SS + 2 * ingroup, st, ss))
+          return 1;
+    }
+  } else {
+    /* Append the new data sector to an existing side sector */
+    uint8_t sst, sss;
+    uint8_t *entry = rel_read_sidesector(buf, n, &sst, &sss);
+
+    if (entry == NULL)
+      return 1;
+
+    entry[0] = t;
+    entry[1] = s;
+    buf->data[SS_OFS_NEXT_SECTOR] = entry + 1 - buf->data;
+    if (rel_write(part, sst, sss, buf->data))
+      return 1;
+  }
+
+  /* Link the previous data sector to the new one, the first data
+     sector is linked from the directory entry */
+  if (n != 0) {
+    uint8_t link[2];
+    link[0] = t;
+    link[1] = s;
+    if (image_write(part, sector_offset(part, prevt, prevs), link, 2, 0))
+      return 1;
+  } else {
+    if (read_entry(part, &buf->pvt.d64.dh, ops_scratch))
+      return 1;
+    ops_scratch[DIR_OFS_TRACK]  = t;
+    ops_scratch[DIR_OFS_SECTOR] = s;
+    if (write_entry(part, &buf->pvt.d64.dh, ops_scratch, 0))
+      return 1;
+  }
+
+  /* Fill the new data sector with the empty record pattern */
+  if (rel_write_empty(buf, n, t, s))
+    return 1;
+
+  buf->pvt.d64.record_max = newmax;
+
+  return rel_update_dir(buf, 0);
+}
+
+/**
+ * rel_grow - extend a REL file to hold a given record
+ * @buf   : buffer of an open REL file
+ * @target: record number to be available, 0-based
+ *
+ * Adds data sectors to the file until record @target exists.
+ * Returns 0 if successful, != 0 otherwise.
+ */
+static uint8_t rel_grow(buffer_t *buf, uint16_t target) {
+  while (buf->pvt.d64.record_max <= target)
+    if (rel_add_data_sector(buf))
+      return 1;
+
+  return 0;
+}
+
+/**
+ * rel_fill_remainder - zero-fill the rest of the current record
+ * @buf: buffer of an open REL file positioned inside a record
+ *
+ * Writes zeroes over the part of the current record that hasn't been
+ * filled by the host, committing every touched sector to disk.
+ * Returns 0 if successful, != 0 otherwise.
+ */
+static uint8_t rel_fill_remainder(buffer_t *buf) {
+  uint32_t end = rel_offset(buf, buf->pvt.d64.record + 1);
+  /* a record holds at most 254 bytes */
+  uint8_t left = (buf->fptr < end) ? (uint8_t)(end - buf->fptr) : 0;
+  uint8_t first = 1;
+
+  while (left) {
+    uint8_t rest = rel_pos(buf->fptr) - 2;
+    uint8_t len  = 254 - rest;
+
+    if (len > left)
+      len = left;
+
+    /* buf->data holds the sector containing the position the transfer
+       stopped at, unless the position sits exactly at a sector
+       boundary - commit the pending sector and load the sector holding
+       the fill range otherwise */
+    if (!(first && rest != 0)) {
+      if (rel_commit(buf))
+        return 1;
+      if (rel_load_fptr(buf))
+        return 1;
+    }
+    first = 0;
+
+    memset(buf->data + 2 + rest, 0, len);
+    mark_buffer_dirty(buf);
+    buf->fptr += len;
+    left -= len;
+  }
+
+  /* Commit the sector holding the end of the record */
+  if (rel_commit(buf))
+    return 1;
+
+  buf->mustflush = 0;
+  return 0;
+}
+
+/**
+ * rel_trim - find the amount of valid data in a record
+ * @buf  : buffer holding the record data
+ * @start: first buffer position of the remaining record part
+ * @end  : last buffer position of the record
+ *
+ * CBM DOS determines the length of a record by scanning from its end
+ * towards the start for the first non-zero byte. This function sets
+ * lastused accordingly. Reading a record always terminates with EOI.
+ * If the whole remaining part is zero-filled the bus layer still needs
+ * a single byte to send, so lastused points at the first byte of the
+ * record part, which is transmitted with EOI.
+ */
+static void rel_trim(buffer_t *buf, uint8_t start, uint8_t end) {
+  uint8_t i = end;
+
+  while (i > start && buf->data[i] == 0)
+    i--;
+
+  buf->lastused = buf->data[i] ? i : start;
+  buf->sendeoi  = 1;
+}
+
+/**
+ * rel_view - set up the read view for the current record
+ * @buf: buffer with the record's start sector loaded and fptr set to
+ *       the first byte to deliver
+ *
+ * Sets position, relstart, lastused and sendeoi for the part of the
+ * record that starts at buf->fptr, scanning the record tail for
+ * zero-filled bytes like CBM DOS does. Records extending into the next
+ * data sector are scanned there as well, so a record whose tail is
+ * completely zero terminates with EOI in this view. The current sector
+ * must not hold uncommitted writes when the record spans two sectors.
+ * Returns 0 if successful, != 0 otherwise.
+ */
+static uint8_t rel_view(buffer_t *buf) {
+  /* fptr lies within the record, so at most 254 bytes remain */
+  uint8_t rest = rel_offset(buf, buf->pvt.d64.record + 1) - buf->fptr;
+  uint8_t tail;
+
+  buf->position = rel_pos(buf->fptr);
+  tail = 256 - buf->position;
+  buf->pvt.d64.relstart = buf->position;
+
+  if (rest <= tail) {
+    rel_trim(buf, buf->position, buf->position + rest - 1);
+    return 0;
+  }
+
+  /* The record continues in the next data sector; check whether its
+     remaining part is zero-filled, in which case it ends in the
+     current sector. */
+  if (rel_load_data_sector(buf, buf->fptr / 254 + 1))
+    return 1;
+
+  {
+    uint8_t continuation = rest - tail;
+    uint8_t first; /* first byte of the continuation, zero means unused */
+
+    while (continuation > 1 && buf->data[2 + continuation - 1] == 0)
+      continuation--;
+    first = buf->data[2];
+
+    /* Restore the current sector before the trim scan */
+    if (rel_load_fptr(buf))
+      return 1;
+
+    if (continuation == 1 && first == 0) {
+      rel_trim(buf, buf->position, 255);
+      return 0;
+    }
+  }
+
+  buf->lastused = 255;
+  buf->sendeoi  = 0;
+  return 0;
+}
+
+/**
+ * rel_present_eof - prepare the buffer to deliver an end-of-file marker
+ * @buf: buffer of an open REL file
+ *
+ * A read past the end of the file delivers a single carriage return
+ * with EOI. Error 50 is reported separately when the marker is
+ * actually transferred, matching the 1541 which only reports it after
+ * a read that ran past the end of the file.
+ */
+static void rel_present_eof(buffer_t *buf) {
+  buf->data[2]     = 13;
+  buf->lastused    = 2;
+  buf->position    = 2;
+  buf->sendeoi     = 1;
+  buf->mustflush   = 0;
+  buf->pvt.d64.relstart = 2;
+}
+
+/**
+ * rel_present_eof_grow - present the end-of-file marker, allow growth
+ * @buf: buffer of an open REL file
+ *
+ * Like rel_present_eof, but on a writable channel the next write
+ * creates the current record.
+ */
+static void rel_present_eof_grow(buffer_t *buf) {
+  rel_present_eof(buf);
+  if (buf->write) {
+    buf->pvt.d64.relflags |= REL_FLAG_GROW;
+    buf->mustflush = 1;
+  }
+}
+
+/**
+ * rel_write_view - set up the buffer to receive record data at fptr
+ * @buf: buffer of an open REL file, the sector holding fptr is loaded
+ */
+static void rel_write_view(buffer_t *buf) {
+  buf->position = rel_pos(buf->fptr);
+  buf->pvt.d64.relstart = buf->position;
+  buf->lastused  = buf->position - 1;
+  buf->sendeoi   = 0;
+  buf->mustflush = 0;
+}
+
+/**
+ * d64_rel_seek - seek-callback for REL files
+ * @buf     : target buffer
+ * @position: record number multiplied by the record length
+ * @index   : position within the record, 0-based
+ *
+ * Positions the buffer at the given record. Seeking to a record that
+ * doesn't exist yet sets error 50; on a writable channel the record
+ * will be created by the next write (growth is deferred so that
+ * seeking alone doesn't extend the file).
+ * Returns 0 if successful, 1 if an error occured.
+ */
+static uint8_t d64_rel_seek(buffer_t *buf, uint32_t position, uint8_t index) {
+  uint16_t record = position / buf->recordlen;
+
+  /* Commit a pending record write, the 1541 does the same */
+  if (buf->dirty && rel_fill_remainder(buf))
+    return 1;
+
+  buf->fptr = position + index;
+  buf->pvt.d64.relflags &= (uint8_t)~(REL_FLAG_GROW | REL_FLAG_OVERFLOW);
+  buf->mustflush = 0;
+
+  buf->pvt.d64.record = record;
+
+  if (record >= buf->pvt.d64.record_max) {
+    /* Growth is deferred to the next write access */
+    rel_present_eof_grow(buf);
+    set_error(ERROR_RECORD_MISSING);
+    return 0;
+  }
+
+  if (rel_load_fptr(buf))
+    return 1;
+
+  buf->mustflush = 0;
+
+  /* A successful positioning command clears the error channel, like
+     the 1541 does */
+  set_error(ERROR_OK);
+
+  /* Set up the read view of the record */
+  return rel_view(buf);
+}
+
+/**
+ * d64_rel_sync - refill-callback for REL files
+ * @buf: target buffer
+ *
+ * This callback completes the current record and advances to the next
+ * one. It is called by the bus layer when a record write is terminated
+ * by EOI, when the sector holding the record is full or when a read has
+ * consumed the current record. Writing past the end of the file
+ * allocates and pattern-fills the required sectors.
+ * Returns 0 if successful, 1 if an error occured.
+ */
+static uint8_t d64_rel_sync(buffer_t *buf) {
+  uint8_t writing;
+  uint32_t rec_end;
+
+  if (buf->pvt.d64.relflags & REL_FLAG_OVERFLOW) {
+    /* A previous write overflowed this record, everything the host
+       writes until the transfer ends is junk. Discard it by restoring
+       the sector from the image. The bus layer clears mustflush on the
+       EOI that ends the transfer - when that refill arrives, resume
+       normal operation at the record after the written one, with the
+       growth still deferred to the next write. */
+    if (rel_restore(buf, 0))
+      return 1;
+    mark_buffer_clean(buf);
+
+    if (buf->mustflush) {
+      /* the transfer is still running */
+      rel_write_view(buf);
+      return 0;
+    }
+
+    buf->pvt.d64.relflags &= (uint8_t)~REL_FLAG_OVERFLOW;
+    /* The sector holds no position of the following record */
+    buf->position = 0;
+    goto next_record;
+  }
+
+  if ((buf->pvt.d64.relflags & REL_FLAG_GROW) &&
+      buf->position == buf->pvt.d64.relstart) {
+    /* Create the record that the host is about to write. Refills for
+       read accesses always transfer at least one byte before entering
+       this callback, so position == relstart means a write is pending. */
+    buf->pvt.d64.relflags &= (uint8_t)~REL_FLAG_GROW;
+
+    if (rel_grow(buf, buf->pvt.d64.record))
+      return 1;
+
+    if (rel_load_fptr(buf))
+      return 1;
+
+    rel_write_view(buf);
+    mark_buffer_clean(buf);
+    return 0;
+  }
+
+  /* Account for the bytes transferred since the last callback */
+  buf->fptr += (buf->position == 0) ? (uint8_t)(256 - buf->pvt.d64.relstart)
+                                    : (uint8_t)(buf->position - buf->pvt.d64.relstart);
+  writing = buf->dirty;
+  rec_end = rel_offset(buf, buf->pvt.d64.record + 1);
+
+  if (buf->fptr > rec_end) {
+    if (writing) {
+      /* The host wrote past the end of the record. Restore the
+         overwritten bytes of the following record from the image (they
+         haven't been committed yet) and report error 51, like a 1541. */
+      if (rel_restore(buf, rel_pos(rec_end)))
+        return 1;
+      set_error(ERROR_RECORD_OVERFLOW);
+      /* If the transfer continues (mustflush set by the sector wrap),
+         everything the host writes from now on is junk and dropped
+         until the next seek or the end of the transfer */
+      if (buf->mustflush)
+        buf->pvt.d64.relflags |= REL_FLAG_OVERFLOW;
+    }
+    buf->fptr = rec_end;
+  }
+
+  if (buf->pvt.d64.record >= buf->pvt.d64.record_max) {
+    /* Reading a record past the end of the file presents the
+       end-of-file marker; error 50 is raised when it is transferred.
+       The next write still creates the record because the growth
+       request and mustflush are kept alive. */
+    rel_present_eof(buf);
+    set_error(ERROR_RECORD_MISSING);
+    buf->mustflush = 1;
+    buf->fptr = rel_offset(buf, buf->pvt.d64.record);
+    return 0;
+  }
+
+  if (buf->fptr < rec_end && buf->position == 0 &&
+      (writing ? buf->mustflush : !buf->sendeoi)) {
+    /* The transfer wrapped at the sector boundary with bytes left in
+       the record: a continuing write is flagged by mustflush, a
+       continuing read by an unset EOI. The record continues in the
+       next data sector. */
+    if (rel_commit(buf))
+      return 1;
+
+    if (rel_load_fptr(buf))
+      return 1;
+
+    buf->position = 2;
+    buf->pvt.d64.relstart = 2;
+    buf->mustflush = 0;
+    buf->lastused = 255;
+    buf->sendeoi  = 0;
+
+    if (!writing && rec_end - buf->fptr < 254)
+      rel_trim(buf, 2, 2 + (uint8_t)(rec_end - buf->fptr) - 1);
+    return 0;
+  }
+
+  /* The current record is complete (fully transferred, consumed by a
+     read, or the transfer was terminated by EOI / the record data
+     ended before the sector boundary) */
+  if (writing) {
+    if (rel_fill_remainder(buf))
+      return 1;
+  }
+
+  buf->pvt.d64.record++;
+
+ next_record:
+  buf->fptr = rel_offset(buf, buf->pvt.d64.record);
+
+  if (buf->pvt.d64.record >= buf->pvt.d64.record_max) {
+    /* The next record does not exist: present the end-of-file marker
+       without raising error 50 yet, it is only reported when the
+       marker is transferred. On a writable channel keep the growth
+       request alive so that the next write creates the record - a
+       1541 does not allocate anything when the last record of a file
+       is rewritten. */
+    rel_present_eof_grow(buf);
+    return 0;
+  }
+
+  /* Position at the next record, skipping the reload if the correct
+     sector is already present */
+  if (buf->position == 0 || buf->position != rel_pos(buf->fptr)) {
+    if (rel_load_fptr(buf))
+      return 1;
+  }
+
+  buf->mustflush = 0;
+
+  /* Always set up a read view so that reading the record directly
+     after a write delivers it correctly. */
+  return rel_view(buf);
+}
+
+/**
+ * d64_rel_cleanup - cleanup-callback for REL files
+ * @buf: target buffer
+ *
+ * Completes a record left unfinished by the host, updates the size
+ * field of the directory entry and frees the buffer.
+ * Returns 0 if successful, 1 if an error occured.
+ */
+static uint8_t d64_rel_cleanup(buffer_t *buf) {
+  if (buf->write) {
+    if (buf->dirty && rel_fill_remainder(buf))
+      return 1;
+
+    if (rel_update_dir(buf, 1))
+      return 1;
+  }
+
+  buf->cleanup = callback_dummy;
+  free_buffer(buf);
+
+  return 0;
+}
+
+/**
+ * rel_calc_record_max - count the records in an existing REL file
+ * @buf: buffer of a REL file, buf->data holds the first side sector block
+ *
+ * Walks the side sector chain to find the last data sector and derives
+ * the number of complete records from the number of used bytes stored
+ * in its link field, the same way a 1541 drive does it.
+ * Returns the number of records.
+ */
+static uint16_t rel_calc_record_max(buffer_t *buf) {
+  uint8_t part = buf->pvt.d64.part;
+  uint8_t track, sector;
+  uint16_t ssindex = 0;
+  uint16_t entries;
+  uint32_t lastsec, total;
+
+  if (buf->pvt.d64.relflags & REL_FLAG_SUPER) {
+    /* The chain starts with the first entry of the super side sector */
+    track  = buf->data[SS_OFS_SUPER_POINTER];
+    sector = buf->data[SS_OFS_SUPER_POINTER + 1];
+    if (rel_read(part, track, sector, buf->data))
+      return 0;
+  }
+
+  while (buf->data[SS_OFS_NEXT_TRACK] != 0) {
+    track  = buf->data[SS_OFS_NEXT_TRACK];
+    sector = buf->data[SS_OFS_NEXT_SECTOR];
+    if (rel_read(part, track, sector, buf->data))
+      return 0;
+    if (++ssindex > SS_CHAIN_LIMIT) {
+      /* cyclic or corrupt chain */
+      set_error(ERROR_IMAGE_INVALID);
+      return 0;
+    }
+  }
+
+  entries = (buf->data[SS_OFS_NEXT_SECTOR] + 1 - SS_OFS_POINTER) / 2;
+  if (entries == 0)
+    return 0;
+
+  /* Read the last data sector to determine its number of used bytes */
+  lastsec = (uint32_t)ssindex * SS_INDICES + entries - 1;
+  if (lastsec > 0xffff) {
+    set_error(ERROR_IMAGE_INVALID);
+    return 0;
+  }
+  if (rel_load_data_sector(buf, (uint16_t)lastsec))
+    return 0;
+
+  total = lastsec * 254;
+  if (buf->data[SS_OFS_NEXT_SECTOR] >= 2)
+    total += buf->data[SS_OFS_NEXT_SECTOR] - 1;
+
+  total /= buf->recordlen;
+  return (total > 0xffff) ? 0xffff : (uint16_t)total;
+}
+
+/**
+ * d64_open_rel - open or create a relative file on a disk image
+ * @path  : path of the file
+ * @dent  : name of the file
+ * @buf   : buffer to be used
+ * @length: record length
+ * @mode  : select between new or existing file
+ *
+ * This function opens a REL file in a D64/D71/D81/DNP image and prepares
+ * it for record-wise access. If the mode parameter is 0, a new file is
+ * created. New files are allocated one data sector and one side sector
+ * block, existing files are located through the side sector chain stored
+ * in the directory entry.
+ */
 static void d64_open_rel(path_t *path, cbmdirent_t *dent, buffer_t *buf, uint8_t length, uint8_t mode) {
+  uint8_t part = path->part;
+  uint8_t writable = partition[part].imagehandle.flag & FA_WRITE;
+  uint8_t mismatch = 0;
+  dh_t dh;
+  uint8_t t, s, sts, sss;
+
+  /* Existing files can be opened on read-only images, only creating
+     requires a writable image */
+  if (!mode && !writable) {
+    set_error(ERROR_WRITE_PROTECT);
+    return;
+  }
+
+  buf->recordlen     = length;
+  buf->pvt.d64.part  = part;
+
+  if (!mode) {
+    /* Create a new REL file and allocate its first data sector */
+    if (create_entry(path, dent, TYPE_REL | FLAG_SPLAT /* closed */, &dh, &t, &s))
+      return;
+
+    ops_scratch[DIR_OFS_RECORD_SIZE] = length;
+    buf->pvt.d64.blocks = 1;
+
+    /* Allocate the first side sector */
+    sts = t;
+    sss = s;
+    if (rel_alloc(buf, &sts, &sss))
+      return;
+
+    ops_scratch[DIR_OFS_SIDESECTOR_TRACK]  = sts;
+    ops_scratch[DIR_OFS_SIDESECTOR_SECTOR] = sss;
+
+    /* D81 and DNP images use a super side sector, D41/D71 do not */
+    if ((partition[part].imagetype & D64_TYPE_MASK) == D64_TYPE_D81 ||
+        (partition[part].imagetype & D64_TYPE_MASK) == D64_TYPE_DNP) {
+      uint8_t spt, sps;
+
+      buf->pvt.d64.relflags |= REL_FLAG_SUPER;
+      spt = sts;
+      sps = sss;
+      if (rel_alloc(buf, &spt, &sps))
+        return;
+
+      memset(buf->data, 0, 256);
+      buf->data[SS_OFS_NEXT_TRACK]  = sts;
+      buf->data[SS_OFS_NEXT_SECTOR] = sss;
+      buf->data[SS_OFS_NUMBER]      = REL_SUPER_MARKER;
+      buf->data[SS_OFS_SUPER_POINTER]     = sts;
+      buf->data[SS_OFS_SUPER_POINTER + 1] = sss;
+      if (rel_write(part, spt, sps, buf->data))
+        return;
+
+      ops_scratch[DIR_OFS_SIDESECTOR_TRACK]  = spt;
+      ops_scratch[DIR_OFS_SIDESECTOR_SECTOR] = sps;
+    }
+
+    /* Initialize the first side sector */
+    rel_init_sidesector(buf, 0, sts, sss, t, s);
+    if (rel_write(part, sts, sss, buf->data))
+      return;
+
+    /* Write the directory entry */
+    update_timestamp(ops_scratch);
+    if (write_entry(part, &dh.dir.d64, ops_scratch, 1))
+      return;
+
+    /* Fill the first data sector with the empty record pattern */
+    if (rel_write_empty(buf, 0, t, s))
+      return;
+
+    buf->pvt.d64.dh        = dh.dir.d64;
+    buf->pvt.d64.sstrack   = ops_scratch[DIR_OFS_SIDESECTOR_TRACK];
+    buf->pvt.d64.sssector  = ops_scratch[DIR_OFS_SIDESECTOR_SECTOR];
+    buf->pvt.d64.record_max = 254 / length;
+  } else {
+    /* Open an existing REL file */
+    if (read_entry(part, &dent->pvt.dxx.dh, ops_scratch))
+      return;
+
+    mismatch = (length != 0 && length != ops_scratch[DIR_OFS_RECORD_SIZE]);
+
+    length = ops_scratch[DIR_OFS_RECORD_SIZE];
+    if (length == 0) {
+      set_error(ERROR_IMAGE_INVALID);
+      return;
+    }
+
+    sts = ops_scratch[DIR_OFS_SIDESECTOR_TRACK];
+    sss = ops_scratch[DIR_OFS_SIDESECTOR_SECTOR];
+    if (sts == 0) {
+      set_error(ERROR_IMAGE_INVALID);
+      return;
+    }
+
+    buf->pvt.d64.dh       = dent->pvt.dxx.dh;
+    buf->pvt.d64.sstrack  = sts;
+    buf->pvt.d64.sssector = sss;
+    buf->pvt.d64.blocks   = ops_scratch[DIR_OFS_SIZE_LOW]
+                          + 256 * ops_scratch[DIR_OFS_SIZE_HI];
+
+    /* Detect a super side sector and count the records in the file */
+    if (rel_read(part, sts, sss, buf->data))
+      return;
+
+    if (buf->data[SS_OFS_NUMBER] == REL_SUPER_MARKER)
+      buf->pvt.d64.relflags |= REL_FLAG_SUPER;
+
+    /* The error channel may still hold an error from a previous
+       command, only errors raised by the walk below abort the open */
+    buf->recordlen = length;
+    set_error(ERROR_OK);
+    buf->pvt.d64.record_max = rel_calc_record_max(buf);
+    if (current_error != ERROR_OK)
+      return;
+  }
+
+  /* Position at the first record */
+  buf->read      = 1;
+  buf->refill    = d64_rel_sync;
+  buf->seek      = d64_rel_seek;
+  buf->cleanup   = d64_rel_cleanup;
+  buf->fptr      = 0;
+  buf->position  = 2;
+  buf->pvt.d64.record   = 0;
+  buf->pvt.d64.relstart = 2;
+
+  /* On a read-only image the file is opened for reading only, the
+     write flag would make the cleanup rewrite the directory entry */
+  if (writable)
+    mark_write_buffer(buf);
+  else
+    stick_buffer(buf);
+
+  if (buf->pvt.d64.record_max == 0) {
+    /* Present an empty file without raising an error on open, the
+       first write creates record 1 */
+    rel_present_eof_grow(buf);
+  } else {
+    if (rel_load_fptr(buf) || rel_view(buf))
+      return;
+  }
+
+  if (mismatch)
+    /* Record length mismatch, the 1541 reports error 50 here too */
+    set_error(ERROR_RECORD_MISSING);
+}
+#else
+/* REL files on disk images are not supported in this build */
+static void d64_open_rel(path_t *path, cbmdirent_t *dent, buffer_t *buf,
+                         uint8_t length, uint8_t mode) {
   (void)path;
   (void)dent;
   (void)buf;
@@ -1545,28 +2625,84 @@ static void d64_open_rel(path_t *path, cbmdirent_t *dent, buffer_t *buf, uint8_t
 
   set_error(ERROR_SYNTAX_UNABLE);
 }
+#endif
 
 static uint8_t d64_delete(path_t *path, cbmdirent_t *dent) {
   uint8_t linkbuf[2];
+  uint32_t steps;
+  uint8_t part = path->part;
+#ifdef CONFIG_D64_REL
+  uint8_t ssbuf[SS_OFS_SUPER_POINTER + 2];
+  uint8_t sstrack, sssector, isrel;
+#endif
 
   /* Read the directory entry of the file */
-  if (read_entry(path->part, &dent->pvt.dxx.dh, ops_scratch))
+  if (read_entry(part, &dent->pvt.dxx.dh, ops_scratch))
     return 255;
+
+#ifdef CONFIG_D64_REL
+  isrel   = (ops_scratch[DIR_OFS_FILE_TYPE] & TYPE_MASK) == TYPE_REL;
+  sstrack = ops_scratch[DIR_OFS_SIDESECTOR_TRACK];
+  sssector = ops_scratch[DIR_OFS_SIDESECTOR_SECTOR];
+#endif
 
   /* Free the sector chain in the BAM */
   linkbuf[0] = ops_scratch[DIR_OFS_TRACK];
   linkbuf[1] = ops_scratch[DIR_OFS_SECTOR];
 
+  steps = 0;
   do {
-    free_sector(path->part, linkbuf[0], linkbuf[1]);
+    free_sector(part, linkbuf[0], linkbuf[1]);
 
-    if (checked_read(path->part, linkbuf[0], linkbuf[1], linkbuf, 2, ERROR_ILLEGAL_TS_LINK))
+    if (checked_read(part, linkbuf[0], linkbuf[1], linkbuf, 2, ERROR_ILLEGAL_TS_LINK))
       return 255;
+
+    if (++steps > FILE_CHAIN_LIMIT) {
+      /* cyclic or corrupt chain */
+      set_error(ERROR_IMAGE_INVALID);
+      return 255;
+    }
   } while (linkbuf[0]);
+
+#ifdef CONFIG_D64_REL
+  /* REL files also reference side sectors, and on images with a super
+     side sector the super side sector block itself. Read into ssbuf,
+     ops_scratch still holds the directory entry for the update below. */
+  if (isrel && sstrack != 0) {
+    if (checked_read(part, sstrack, sssector, ssbuf, sizeof(ssbuf),
+                     ERROR_ILLEGAL_TS_LINK))
+      return 255;
+
+    if (ssbuf[SS_OFS_NUMBER] == REL_SUPER_MARKER) {
+      /* free the super side sector block and start the walk at the
+         first group, its chain continues across all groups */
+      free_sector(part, sstrack, sssector);
+      linkbuf[0] = ssbuf[SS_OFS_SUPER_POINTER];
+      linkbuf[1] = ssbuf[SS_OFS_SUPER_POINTER + 1];
+    } else {
+      linkbuf[0] = sstrack;
+      linkbuf[1] = sssector;
+    }
+
+    steps = 0;
+    do {
+      free_sector(part, linkbuf[0], linkbuf[1]);
+
+      if (checked_read(part, linkbuf[0], linkbuf[1], linkbuf, 2, ERROR_ILLEGAL_TS_LINK))
+        return 255;
+
+      if (++steps > SS_CHAIN_LIMIT) {
+        /* cyclic or corrupt chain */
+        set_error(ERROR_IMAGE_INVALID);
+        return 255;
+      }
+    } while (linkbuf[0]);
+  }
+#endif
 
   /* Clear directory entry */
   ops_scratch[DIR_OFS_FILE_TYPE] = 0;
-  if (write_entry(path->part, &dent->pvt.dxx.dh, ops_scratch, 1))
+  if (write_entry(part, &dent->pvt.dxx.dh, ops_scratch, 1))
     return 255;
 
   return 1;

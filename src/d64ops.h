@@ -41,6 +41,11 @@
 #define DIR_OFS_SIZE_LOW        0x1e
 #define DIR_OFS_SIZE_HI         0x1f
 
+/* REL file specific directory entry offsets */
+#define DIR_OFS_SIDESECTOR_TRACK  21
+#define DIR_OFS_SIDESECTOR_SECTOR 22
+#define DIR_OFS_RECORD_SIZE       23
+
 /* Disk image types - values must match G-P partition type byte */
 #define D64_TYPE_MASK 0x7f
 #define D64_TYPE_NONE 0

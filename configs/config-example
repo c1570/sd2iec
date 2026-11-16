@@ -36,6 +36,9 @@ CONFIG_HAVE_IEC=y
 # device has EEPROM filesystem - EEPROM should be at least 4k
 #CONFIG_HAVE_EEPROMFS=y
 
+# REL files in disk images (D64/D71/D81/DNP), about 4.5k of flash
+CONFIG_D64_REL=y
+
 # target architecture
 CONFIG_ARCH=avr
 
