@@ -940,3 +940,17 @@ An example configuration file named "config-example" is provided with
 the source code, as well as abridged files corresponding to the
 release binaries. If you want to compile sd2iec for a custom hardware
 you may have to edit config.h too to change the port definitions.
+
+Raspberry Pi Pico 2 (RP2350):
+The rppico architecture (configs/config-rppico) is built with the
+Pico SDK, version 2.3.1, plus cmake and arm-none-eabi-gcc. Point
+PICO_SDK_PATH to an SDK checkout and run
+"make CONFIG=configs/config-rppico". The first build downloads and
+compiles picotool unless it is installed. Besides sd2iec.elf/.bin
+this creates sd2iec.uf2, which can be copied to the Pico while it
+is in BOOTSEL mode. config-rppico is for IEC lines buffered with a
+74LVC04 (inputs) and a 7406 (outputs), add
+configs/addconfig-rppico-direct for lines connected directly to the
+RP2350. The pin assignment is documented in src/rppico/arch-config.h.
+The configuration and EEPROMFS contents are stored in the last 24KiB
+of the flash.
