@@ -24,7 +24,6 @@
 */
 
 #include "config.h"
-#include "bitband.h"
 #include "fastloader.h" // for fl_track etc.
 #include "iec-bus.h"
 #include "llfl-common.h"

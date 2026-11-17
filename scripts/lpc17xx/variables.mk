@@ -5,16 +5,16 @@ ASMSRC = lpc17xx/pseudoboot.S lpc17xx/startup.S lpc17xx/crc.S
 
 SRC += lpc17xx/iec-bus.c
 SRC += lpc17xx/llfl-common.c
-SRC += lpc17xx/llfl-jiffydos.c
-SRC += lpc17xx/llfl-turbodisk.c
-SRC += lpc17xx/llfl-fc3exos.c
-SRC += lpc17xx/llfl-ar6.c
-SRC += lpc17xx/llfl-dreamload.c
-SRC += lpc17xx/llfl-ulm3.c
-SRC += lpc17xx/llfl-epyxcart.c
-SRC += lpc17xx/llfl-geos.c
+SRC += llfl/llfl-jiffydos.c
+SRC += llfl/llfl-turbodisk.c
+SRC += llfl/llfl-fc3exos.c
+SRC += llfl/llfl-ar6.c
+SRC += llfl/llfl-dreamload.c
+SRC += llfl/llfl-ulm3.c
+SRC += llfl/llfl-epyxcart.c
+SRC += llfl/llfl-geos.c
 SRC += lpc17xx/llfl-parallel.c
-SRC += lpc17xx/llfl-n0sdos.c
+SRC += llfl/llfl-n0sdos.c
 
 ifeq ($(CONFIG_UART_DEBUG),y)
   SRC += lpc17xx/printf.c
@@ -43,7 +43,7 @@ CRCGEN        = scripts/lpc17xx/crcgen-lpc.pl
 
 
 #---------------- Architecture variables ----------------
-ARCH_CFLAGS  = -mthumb -mcpu=cortex-m3 -nostartfiles
+ARCH_CFLAGS  = -mthumb -mcpu=cortex-m3 -nostartfiles -Isrc/llfl
 ARCH_ASFLAGS = -mthumb -mcpu=cortex-m3
 ARCH_LDFLAGS = -Tscripts/lpc17xx/$(CONFIG_MCU).ld
 

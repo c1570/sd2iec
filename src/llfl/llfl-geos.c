@@ -24,7 +24,6 @@
 */
 
 #include "config.h"
-#include "bitband.h"
 #include "iec-bus.h"
 #include "llfl-common.h"
 #include "timer.h"

@@ -19,74 +19,73 @@
    Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
 
 
-   llfl-ar6.c: Low level handling of AR6 fastloader
+   llfl-turbodisk.c: Low level handling of Turbodisk fastloader
 
 */
 
 #include "config.h"
-#include "bitband.h"
 #include "iec-bus.h"
 #include "llfl-common.h"
-#include "system.h"
 #include "timer.h"
 #include "fastloader-ll.h"
 
-
-static const generic_2bit_t ar6_1581_send_def = {
-  .pairtimes = {50, 130, 210, 290},
-  .clockbits = {0, 2, 4, 6},
-  .databits  = {1, 3, 5, 7},
+static const generic_2bit_t turbodisk_byte_def = {
+  .pairtimes = {310, 600, 890, 1180},
+  .clockbits = {7, 5, 3, 1},
+  .databits  = {6, 4, 2, 0},
   .eorvalue  = 0
 };
 
-static const generic_2bit_t ar6_1581p_get_def = {
-  .pairtimes = {120, 220, 380, 480},
-  .clockbits = {7, 6, 3, 2},
-  .databits  = {5, 4, 1, 0},
-  .eorvalue  = 0xff
-};
-
-void ar6_1581_send_byte(uint8_t byte) {
+void turbodisk_byte(uint8_t value) {
   llfl_setup();
-  disable_interrupts();
 
   /* wait for handshake */
+  while (IEC_DATA) ;
   set_clock(1);
   llfl_wait_data(1, NO_ATNABORT);
 
   /* transmit data */
-  llfl_generic_load_2bit(&ar6_1581_send_def, byte);
+  llfl_generic_load_2bit(&turbodisk_byte_def, value);
 
   /* exit with clock low, data high */
-  llfl_set_clock_at(375, 0, NO_WAIT);
-  llfl_set_data_at( 375, 1, WAIT);
+  llfl_set_clock_at(1470, 0, NO_WAIT);
+  llfl_set_data_at( 1470, 1, WAIT);
+  delay_us(5);
 
-  /* short delay to make sure bus has settled */
-  delay_us(10);
-
-  enable_interrupts();
   llfl_teardown();
 }
 
-uint8_t ar6_1581p_get_byte(void) {
-  uint8_t result;
+void turbodisk_buffer(uint8_t *data, uint8_t length) {
+  unsigned int pair;
+  uint32_t ticks;
 
   llfl_setup();
-  disable_interrupts();
-
-  set_clock(1);
 
   /* wait for handshake */
   while (IEC_DATA) ;
+  set_clock(1);
   llfl_wait_data(1, NO_ATNABORT);
 
-  /* receive data */
-  result = llfl_generic_save_2bit(&ar6_1581p_get_def);
+  ticks = 70;
+  while (length--) {
+    uint8_t byte = *data++;
 
-  /* exit with clock low */
-  llfl_set_clock_at(530, 0, WAIT);
+    ticks += 120;
+    for (pair = 0; pair < 4; pair++) {
+      ticks += 240;
+      llfl_set_clock_at(ticks, byte & 0x80, NO_WAIT);
+      llfl_set_data_at (ticks, byte & 0x40, WAIT);
+      ticks += 50;
+      byte <<= 2;
+    }
+    ticks += 100;
+  }
 
-  enable_interrupts();
+  ticks += 110;
+
+  llfl_set_clock_at(ticks, 0, NO_WAIT);
+  llfl_set_data_at( ticks, 1, WAIT);
+  delay_us(5);
+
   llfl_teardown();
-  return result;
 }
