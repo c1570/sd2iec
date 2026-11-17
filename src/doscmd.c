@@ -1175,25 +1175,22 @@ static void handle_memread(void) {
   address = command_buffer[3] + (command_buffer[4]<<8);
 
   if (address >= 0x8000 && rom_filename[0] != 0) {
-    /* Try to use the rom file as data source - look in the current dir first */
-    partition[current_part].fatfs.curr_dir = partition[current_part].current_dir.fat;
-    res = f_open(&partition[current_part].fatfs, &romfile, rom_filename, FA_READ | FA_OPEN_EXISTING);
+    /* Try to use the rom file as data source: look in the current dir,
+       then in the root dir and finally in the root of drive 0 */
+    uint8_t attempt;
 
-    if (res != FR_OK) {
-      /* Not successful, try root dir */
-      partition[current_part].fatfs.curr_dir = 0;
-      res = f_open(&partition[current_part].fatfs, &romfile, rom_filename, FA_READ | FA_OPEN_EXISTING);
+    for (attempt = 0; attempt < 3; attempt++) {
+      FATFS *fs = &partition[attempt == 2 ? 0 : current_part].fatfs;
 
-      if (res != FR_OK) {
-        /* Not successful, try root of drive 0 */
-        partition[0].fatfs.curr_dir = 0;
-        res = f_open(&partition[0].fatfs, &romfile, rom_filename, FA_READ | FA_OPEN_EXISTING);
-
-        if (res != FR_OK)
-          /* No file available - use internal table */
-          goto use_internal;
-      }
+      fs->curr_dir = attempt ? 0 : partition[current_part].current_dir.fat;
+      res = f_open(fs, &romfile, rom_filename, FA_READ | FA_OPEN_EXISTING);
+      if (res == FR_OK)
+        break;
     }
+
+    if (res != FR_OK)
+      /* No file available - use internal table */
+      goto use_internal;
 
     /* One of the f_open calls was successful */
     address -= 0x8000;
