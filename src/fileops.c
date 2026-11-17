@@ -118,6 +118,13 @@ const PROGMEM uint8_t filetypes[] = {
 /*  Utility functions                                                        */
 /* ------------------------------------------------------------------------- */
 
+#ifdef __AVR__
+/* Look up a file operation of a partition, see wrapops.h */
+fop_t fop_lookup(uint8_t part, uint8_t offset) {
+  return (fop_t)pgm_read_word((const uint8_t *)partition[part].fop + offset);
+}
+#endif
+
 /**
  * createentry - create a single directory entry in buf
  * @dent  : directory entry to be added

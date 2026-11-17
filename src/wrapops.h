@@ -30,6 +30,7 @@
 #ifndef WRAPOPS_H
 #define WRAPOPS_H
 
+#include <stddef.h>
 #include "buffers.h"
 #include "fileops.h"
 #include "ff.h"
@@ -78,30 +79,32 @@ typedef struct fileops_s {
   void     (*rename)(path_t *path, cbmdirent_t *oldname, uint8_t *newname);
 } fileops_t;
 
-/* Helper-Define to avoid lots of typedefs */
+/* Look up a file operation of a partition */
 #ifdef __AVR__
-#  define pgmcall(x) ((typeof(x))pgm_read_word(&(x)))
+/* The lookup sequence is long on AVR, keep it out of line */
+typedef void (*fop_t)(void);
+fop_t fop_lookup(uint8_t part, uint8_t offset);
+#  define fopcall(part,op) ((typeof(((fileops_t *)0)->op))fop_lookup(part, offsetof(fileops_t, op)))
 #else
-/* No-op macro - avoids issues with different function pointer sizes */
-#  define pgmcall(x) x
+#  define fopcall(part,op) (partition[part].fop->op)
 #endif
 
 /* Wrappers to make the indirect calls look like normal functions */
-#define open_read(path,name,buf) ((pgmcall(partition[(path)->part].fop->open_read))(path,name,buf))
-#define open_write(path,name,type,buf,app) ((pgmcall(partition[(path)->part].fop->open_write))(path,name,type,buf,app))
-#define open_rel(path,name,buf,len,mode) ((pgmcall(partition[(path)->part].fop->open_rel))(path,name,buf,len,mode))
-#define file_delete(path,name) ((pgmcall(partition[(path)->part].fop->file_delete))(path,name))
-#define disk_label(part,label) ((pgmcall(partition[part].fop->disk_label))(part,label))
-#define dir_label(path,label) ((pgmcall(partition[(path)->part].fop->dir_label))(path,label))
-#define disk_id(path,id) ((pgmcall(partition[(path)->part].fop->disk_id))(path,id))
-#define disk_free(drv) ((pgmcall(partition[drv].fop->disk_free))(drv))
-#define read_sector(buf,drv,t,s) ((pgmcall(partition[(drv)].fop->read_sector))(buf,drv,t,s))
-#define write_sector(buf,drv,t,s) ((pgmcall(partition[(drv)].fop->write_sector))(buf,drv,t,s))
-#define format(drv,name,id) ((pgmcall(partition[(drv)].fop->format))(drv,name,id))
-#define opendir(dh,path) ((pgmcall(partition[(path)->part].fop->opendir))(dh,path))
-#define readdir(dh,dent) ((pgmcall(partition[(dh)->part].fop->readdir))(dh,dent))
-#define mkdir(path,dir) ((pgmcall(partition[(path)->part].fop->mkdir))(path,dir))
-#define chdir(path,dent) ((pgmcall(partition[(path)->part].fop->chdir))(path,dent))
-#define rename(path,old,new) ((pgmcall(partition[(path)->part].fop->rename))(path,old,new))
+#define open_read(path,name,buf) (fopcall((path)->part, open_read)(path,name,buf))
+#define open_write(path,name,type,buf,app) (fopcall((path)->part, open_write)(path,name,type,buf,app))
+#define open_rel(path,name,buf,len,mode) (fopcall((path)->part, open_rel)(path,name,buf,len,mode))
+#define file_delete(path,name) (fopcall((path)->part, file_delete)(path,name))
+#define disk_label(part,label) (fopcall(part, disk_label)(part,label))
+#define dir_label(path,label) (fopcall((path)->part, dir_label)(path,label))
+#define disk_id(path,id) (fopcall((path)->part, disk_id)(path,id))
+#define disk_free(drv) (fopcall(drv, disk_free)(drv))
+#define read_sector(buf,drv,t,s) (fopcall(drv, read_sector)(buf,drv,t,s))
+#define write_sector(buf,drv,t,s) (fopcall(drv, write_sector)(buf,drv,t,s))
+#define format(drv,name,id) (fopcall(drv, format)(drv,name,id))
+#define opendir(dh,path) (fopcall((path)->part, opendir)(dh,path))
+#define readdir(dh,dent) (fopcall((dh)->part, readdir)(dh,dent))
+#define mkdir(path,dir) (fopcall((path)->part, mkdir)(path,dir))
+#define chdir(path,dent) (fopcall((path)->part, chdir)(path,dent))
+#define rename(path,old,new) (fopcall((path)->part, rename)(path,old,new))
 
 #endif
