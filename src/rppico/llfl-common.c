@@ -37,6 +37,7 @@
 
 #include "config.h"
 #include "pico.h"
+#include "atomic.h"
 #include "hardware/structs/m33.h"
 #include "fastloader.h"
 #include "iec-bus.h"
@@ -68,7 +69,7 @@ static uint32_t reference_ticks;
 
 static llfl_event_t events[LINE_COUNT];
 static unsigned int pending_lines;
-static uint32_t saved_irq_state;
+static unsigned int saved_irq_state;
 
 static inline __attribute__((always_inline)) uint32_t llfl_cycles(void) {
   return m33_hw->dwt_cyccnt;
@@ -127,8 +128,8 @@ void llfl_setup(void) {
   m33_hw->dwt_ctrl |= M33_DWT_CTRL_CYCCNTENA_BITS;
 
   /* interrupts would delay line changes */
-  __asm__ volatile ("mrs %0, primask" : "=r" (saved_irq_state));
-  __asm__ volatile ("cpsid i" ::: "memory");
+  saved_irq_state = __get_primask();
+  __iCliRetVal();
   pending_lines   = 0;
 }
 
@@ -137,7 +138,7 @@ void llfl_teardown(void) {
   while (pending_lines)
     apply_pending(llfl_cycles());
 
-  __asm__ volatile ("msr primask, %0" :: "r" (saved_irq_state) : "memory");
+  __iRestore(&saved_irq_state);
 }
 
 /**

@@ -1,0 +1,33 @@
+Host-side tests for the rppico fastloader timing
+================================================
+
+src/rppico/llfl-common.c implements the timing interface used by the
+low-level fastloader code (src/llfl/) with busy-waits on the CPU cycle
+counter. This test compiles it for the host against the shims in
+shims/, which replace the cycle counter, the bus inputs and the bus
+outputs with a simulation in llfltest.c: reading the cycle counter or
+the inputs advances the simulated time, the inputs follow a waveform
+of that time, and every line change is recorded with its time.
+
+Covered:
+
+  - generic 2-bit send (JiffyDOS timing) for all byte values: both
+    lines of a pair change in the same write, no earlier than the
+    requested time and at most 40 cycles later, with interrupts
+    disabled
+  - a NO_WAIT change that is applied by llfl_teardown, and restoring
+    the interrupt state
+  - generic 2-bit receive for all byte values
+  - all of the above with cycle counter wrap during the transfer
+  - a reference time set by the caller (as the FC3 sender does)
+  - ATN abort while waiting for a line, flagging of late changes
+
+The bus protocol of the individual loaders and the real pin timing
+still need testing on hardware.
+
+Running the tests
+-----------------
+
+    make check      builds and runs the tests, plain and with
+                    ASan/UBSan
+    make clean      removes build/
