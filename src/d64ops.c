@@ -243,31 +243,30 @@ static uint8_t checked_read(uint8_t part, uint8_t track, uint8_t sector, uint8_t
       /* Read the error info for this track */
       memset(errorcache.errors, 1, sizeof(errorcache.errors));
 
+      uint32_t erroroffset;
+
       switch (partition[part].imagetype & D64_TYPE_MASK) {
       case D64_TYPE_D41:
-        if (image_read(part, D41_ERROR_OFFSET + sector_lba(part,track,0),
-                       errorcache.errors, sectors_per_track(part, track)) >= 2)
-          return 2;
+        erroroffset = D41_ERROR_OFFSET;
         break;
 
       case D64_TYPE_D71:
-        if (image_read(part, D71_ERROR_OFFSET + sector_lba(part,track,0),
-                       errorcache.errors, sectors_per_track(part, track)) >= 2)
-          return 2;
+        erroroffset = D71_ERROR_OFFSET;
         break;
 
       case D64_TYPE_D81:
-        if (image_read(part, D81_ERROR_OFFSET + sector_lba(part,track,0),
-                       errorcache.errors, sectors_per_track(part, track)) >= 2)
-          return 2;
+        erroroffset = D81_ERROR_OFFSET;
         break;
 
       default:
         /* Should not happen unless someone enables error info
            for additional image formats */
         return 2;
-
       }
+
+      if (image_read(part, erroroffset + sector_lba(part,track,0),
+                     errorcache.errors, sectors_per_track(part, track)) >= 2)
+        return 2;
       errorcache.part  = part;
       errorcache.track = track;
     }
@@ -1011,19 +1010,18 @@ static uint8_t find_empty_entry(path_t *path, dh_t *dh) {
         return 1;
 
       if (ops_scratch[0] != 0) {
-        /* Read block count of entry in parent directory */
-        if (image_read(path->part,
-                       sector_offset(path->part, ops_scratch[0], ops_scratch[1]) + ops_scratch[2] + DIR_OFS_SIZE_LOW - 2,
-                       ops_scratch + 3, 2))
+        /* Block count of the entry in the parent directory */
+        uint32_t ofs = sector_offset(path->part, ops_scratch[0], ops_scratch[1]) +
+                       ops_scratch[2] + DIR_OFS_SIZE_LOW - 2;
+
+        if (image_read(path->part, ofs, ops_scratch + 3, 2))
           return 1;
 
         uint16_t *blocks = (uint16_t *)(ops_scratch + 3);
         (*blocks)++;
 
         /* Write new block count */
-        if (image_write(path->part,
-                        sector_offset(path->part, ops_scratch[0], ops_scratch[1]) + ops_scratch[2] + DIR_OFS_SIZE_LOW - 2,
-                        ops_scratch + 3, 2, 1))
+        if (image_write(path->part, ofs, ops_scratch + 3, 2, 1))
           return 1;
       }
     }
@@ -1453,6 +1451,23 @@ static void d64_open_read(path_t *path, cbmdirent_t *dent, buffer_t *buf) {
 }
 
 /**
+ * init_entry - build a new directory entry in ops_scratch
+ * @name: zero-terminated name of the entry
+ * @type: file type byte of the entry
+ *
+ * Clears the entry except for the link pointer in its first two bytes,
+ * which belongs to the directory sector, and fills in name and type.
+ */
+static void init_entry(const uint8_t *name, uint8_t type) {
+  uint8_t *ptr = ops_scratch + DIR_OFS_FILE_NAME;
+
+  memset(ops_scratch + 2, 0, sizeof(ops_scratch) - 2);
+  memset(ops_scratch + DIR_OFS_FILE_NAME, 0xa0, CBM_NAME_LENGTH);
+  while (*name) *ptr++ = *name++;
+  ops_scratch[DIR_OFS_FILE_TYPE] = type;
+}
+
+/**
  * create_entry - prepare the directory entry of a new file
  * @path: path of the file
  * @dent: name of the file
@@ -1468,16 +1483,10 @@ static void d64_open_read(path_t *path, cbmdirent_t *dent, buffer_t *buf) {
  */
 static uint8_t create_entry(path_t *path, cbmdirent_t *dent, uint8_t type,
                             dh_t *dh, uint8_t *t, uint8_t *s) {
-  uint8_t *name = dent->name;
-  uint8_t *ptr  = ops_scratch + DIR_OFS_FILE_NAME;
-
   if (find_empty_entry(path, dh))
     return 1;
 
-  memset(ops_scratch + 2, 0, sizeof(ops_scratch) - 2);  /* Don't overwrite the link pointer! */
-  memset(ops_scratch + DIR_OFS_FILE_NAME, 0xa0, CBM_NAME_LENGTH);
-  while (*name) *ptr++ = *name++;
-  ops_scratch[DIR_OFS_FILE_TYPE] = type;
+  init_entry(dent->name, type);
 
   /* Find a free sector and allocate it */
   if (get_first_sector(path->part, t, s))
@@ -2905,22 +2914,11 @@ static void d64_mkdir(path_t *path, uint8_t *dirname) {
     return;
 
   /* Create empty directory sector */
-  memset(buf->data, 0, 256);
-  buf->data[1] = 0xff;
-  if (image_write(path->part,
-                  sector_offset(path->part, d_track, d_sector),
-                  buf->data, 256, 0))
+  if (clear_dir_sector(path->part, d_track, d_sector, buf->data))
     return;
 
   /* Create the directory entry */
-  /* FIXME: Isn't similiar code duplicated in open_write and rename? */
-  memset(ops_scratch + 2, 0, sizeof(ops_scratch) - 2);
-  memset(ops_scratch + DIR_OFS_FILE_NAME, 0xa0, CBM_NAME_LENGTH);
-
-  ptr = ops_scratch + DIR_OFS_FILE_NAME;
-  while (*dirname) *ptr++ = *dirname++;
-
-  ops_scratch[DIR_OFS_FILE_TYPE] = TYPE_DIR | FLAG_SPLAT;
+  init_entry(dirname, TYPE_DIR | FLAG_SPLAT);
   ops_scratch[DIR_OFS_TRACK]     = h_track;
   ops_scratch[DIR_OFS_SECTOR]    = h_sector;
   ops_scratch[DIR_OFS_SIZE_LOW]  = 2;
