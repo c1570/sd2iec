@@ -65,6 +65,11 @@ ifneq ($(CONFIG_NO_SD),y)
   SRC += sdcard.c
 endif
 
+ifeq ($(CONFIG_EMBEDDED_D64),y)
+  SRC += embedded-d64.c
+  EMBEDDED_D64_HDR := $(OBJDIR)/embedded-d64-data.h
+endif
+
 ifeq ($(CONFIG_M2I),y)
   SRC += m2iops.c
 endif
@@ -288,6 +293,14 @@ eep: $(TARGET).eep
 lss: $(TARGET).lss
 sym: $(TARGET).sym
 
+ifeq ($(CONFIG_EMBEDDED_D64),y)
+$(EMBEDDED_D64_HDR): src/embedded-d64.d64 scripts/bindata.py | $(OBJDIR)
+	$(E) "  BINDATA $@"
+	$(Q)scripts/bindata.py $< $@ embedded_d64_data
+
+$(OBJDIR)/src/embedded-d64.o: $(EMBEDDED_D64_HDR)
+endif
+
 
 # Doxygen output:
 doxygen:
@@ -390,6 +403,7 @@ clean:
 	$(Q)$(REMOVE) $(OBJDIR)/autoconf.h
 	$(Q)$(REMOVE) $(OBJDIR)/make.inc
 	$(Q)$(REMOVE) $(OBJDIR)/asmconfig.h
+	$(Q)$(REMOVE) $(OBJDIR)/embedded-d64-data.h
 	$(Q)$(REMOVE) $(OBJDIR)/*.bin
 	$(Q)$(REMOVE) $(LST)
 	$(Q)$(REMOVE) $(CSRC:.c=.s)

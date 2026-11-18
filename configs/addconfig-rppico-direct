@@ -20,3 +20,6 @@
 
 CONFIG_HARDWARE_VARIANT=1
 NAME_OVERRIDE=direct
+
+# Debug build: serve a built-in D64 image instead of accessing the SD card
+CONFIG_EMBEDDED_D64=n

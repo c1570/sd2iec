@@ -82,7 +82,11 @@ int main(void) {
   /* should be placed after system_init_late() */
   bus_init();    // needs delay
   rtc_init();    // accesses I2C
+#ifdef CONFIG_EMBEDDED_D64
+  /* Embedded image build: no SD card access */
+#else
   disk_init();   // accesses card
+#endif
   read_configuration();
 
   filesystem_init(0);

@@ -1,0 +1,9 @@
+# This may not look like it, but it's a -*- makefile -*-
+#
+#  addconfig-embedded-d64: debug addon that serves the built-in image
+#                          src/embedded-d64.d64 instead of the SD card
+#
+# Use after the board configs, e.g.
+#   make CONFIG=configs/config-rppico,configs/addconfig-rppico-direct,configs/addconfig-embedded-d64
+
+CONFIG_EMBEDDED_D64=y

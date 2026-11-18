@@ -49,6 +49,7 @@
 #include "ustring.h"
 #include "wrapops.h"
 #include "fatops.h"
+#include "embedded-d64.h"
 
 #define P00_HEADER_SIZE       26
 #define P00_CBMNAME_OFFSET    8
@@ -1482,6 +1483,10 @@ void fat_rename(path_t *path, cbmdirent_t *dent, uint8_t *newname) {
  * is required.
  */
 void fatops_init(uint8_t preserve_path) {
+#ifdef CONFIG_EMBEDDED_D64
+  /* Skip the SD card/FAT stack entirely and serve the built-in image */
+  embedded_d64_mount(preserve_path);
+#else
   FRESULT res;
   uint8_t realdrive,drive,part;
 
@@ -1530,6 +1535,7 @@ void fatops_init(uint8_t preserve_path) {
     return;
   }
 #endif
+#endif
 }
 
 /**
@@ -1543,6 +1549,15 @@ void fatops_init(uint8_t preserve_path) {
  */
 uint8_t image_unmount(uint8_t part) {
   FRESULT res;
+
+#ifdef CONFIG_EMBEDDED_D64
+  /* There is no underlying FAT volume to return to, just remount */
+  if (embedded_d64_active) {
+    free_multiple_buffers(FMB_USER_CLEAN);
+    embedded_d64_mount(1);
+    return 0;
+  }
+#endif
 
   free_multiple_buffers(FMB_USER_CLEAN);
 
@@ -1618,6 +1633,11 @@ uint8_t image_read(uint8_t part, DWORD offset, void *buffer, uint16_t bytes) {
   FRESULT res;
   UINT bytesread;
 
+#ifdef CONFIG_EMBEDDED_D64
+  if (embedded_d64_active)
+    return embedded_d64_read(offset, buffer, bytes);
+#endif
+
   if (offset != (DWORD)-1) {
     res = f_lseek(&partition[part].imagehandle, offset);
     if (res != FR_OK) {
@@ -1653,6 +1673,13 @@ uint8_t image_read(uint8_t part, DWORD offset, void *buffer, uint16_t bytes) {
 uint8_t image_write(uint8_t part, DWORD offset, void *buffer, uint16_t bytes, uint8_t flush) {
   FRESULT res;
   UINT byteswritten;
+
+#ifdef CONFIG_EMBEDDED_D64
+  if (embedded_d64_active) {
+    set_error(ERROR_WRITE_PROTECT);
+    return 2;
+  }
+#endif
 
   if (offset != (DWORD)-1) {
     res = f_lseek(&partition[part].imagehandle, offset);
