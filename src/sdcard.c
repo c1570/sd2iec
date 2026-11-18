@@ -711,7 +711,6 @@ DRESULT disk_write(BYTE drv, const BYTE *buffer, DWORD sector, BYTE count) __att
  */
 DRESULT sd_getinfo(BYTE drv, BYTE page, void *buffer) {
   uint8_t buf[18];
-  uint8_t res;
   uint32_t capacity;
 
   if (drv >= MAX_CARDS)
@@ -729,11 +728,11 @@ DRESULT sd_getinfo(BYTE drv, BYTE page, void *buffer) {
     return RES_ERROR;
   }
 
-  /* Wait for data token */
-  // FIXME: Timeout?
-  do {
-    res = spi_rx_byte();
-  } while (res == 0);
+  /* Wait for the data token, cards send 0xff bytes before it */
+  if (!expect_byte(0xfe)) {
+    deselect_card();
+    return RES_ERROR;
+  }
 
   spi_rx_block(buf, 18);
   deselect_card();
